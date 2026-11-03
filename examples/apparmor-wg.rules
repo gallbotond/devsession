@@ -1,0 +1,3 @@
+# devsession: root-only session keys and disposable local acceptance keys
+/var/lib/devsession/**/vpn/** r,
+/tmp/opencode/devsession-lab/** r,

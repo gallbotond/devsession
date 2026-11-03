@@ -1,0 +1,75 @@
+{
+  "terraform": {
+    "path": "/usr/local/bin/terraform",
+    "realpath": "/usr/local/bin/terraform",
+    "version": [
+      "Terraform v1.17.1",
+      "on linux_amd64"
+    ]
+  },
+  "ansible": {
+    "path": "/usr/bin/ansible",
+    "realpath": "/usr/bin/ansible",
+    "version": [
+      "ansible [core 2.20.1]",
+      "  config file = None"
+    ]
+  },
+  "tmux": {
+    "path": "/usr/bin/tmux",
+    "realpath": "/usr/bin/tmux",
+    "version": [
+      "tmux 3.6"
+    ]
+  },
+  "oh-my-posh": {
+    "path": "/usr/local/bin/oh-my-posh",
+    "realpath": "/usr/local/bin/oh-my-posh",
+    "version": [
+      "31.9.1"
+    ]
+  },
+  "az": {
+    "path": "/usr/local/bin/az",
+    "realpath": "/opt/devsession-tools/azure/bin/az",
+    "version": [
+      "{",
+      "  \"azure-cli\": \"2.92.0\","
+    ]
+  },
+  "python3": {
+    "path": "/usr/bin/python3",
+    "realpath": "/usr/bin/python3.14",
+    "version": [
+      "Python 3.14.4"
+    ]
+  },
+  "ds-user-tool": {
+    "path": "/home/ubuntu/.local/bin/ds-user-tool",
+    "realpath": "/home/ubuntu/.local/bin/ds-user-tool",
+    "version": [
+      "user-local-ok"
+    ]
+  },
+  "node": {
+    "path": "/home/ubuntu/.nvm/versions/node/v26.13.0/bin/node",
+    "realpath": "/home/ubuntu/.nvm/versions/node/v26.13.0/bin/node",
+    "version": [
+      "v26.13.0"
+    ]
+  },
+  "npm": {
+    "path": "/home/ubuntu/.nvm/versions/node/v26.13.0/bin/npm",
+    "realpath": "/home/ubuntu/.nvm/versions/node/v26.13.0/lib/node_modules/npm/bin/npm-cli.js",
+    "version": [
+      "11.20.0"
+    ]
+  },
+  "/tmp/opencode/devsession-accept-1ui1kwvr/project/.venv/bin/python": {
+    "path": "/tmp/opencode/devsession-accept-1ui1kwvr/project/.venv/bin/python",
+    "realpath": "/usr/bin/python3.14",
+    "version": [
+      "Python 3.14.4"
+    ]
+  }
+}
