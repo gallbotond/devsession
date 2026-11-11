@@ -77,6 +77,12 @@ devsession create coding \
 devsession inspect coding
 ```
 
+`--host-tools` approves every host `PATH` entry outside `/usr` in one step.
+Each directory is mounted read-only as itself; the surrounding installation is
+mounted instead only for asdf-style `shims` and symlink farms such as
+Homebrew's `bin`, so a sibling file like a tool's `auth.json` is not exposed.
+Snap and credential/config paths are skipped. Check the result with `inspect`.
+
 Using the **original project path** preserves project-venv absolute shebangs.
 Include full runtime/toolchain trees, not just binary symlinks. Install/update
 tools on the host. `inspect` lists every installation and project mount.

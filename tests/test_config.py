@@ -32,6 +32,22 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ds.Error):
                     ds.openvpn_import(src, p, ['10.77.0.1'])
 
+    def test_host_tools_prefers_install_tree_within_policy(self):
+        with tempfile.TemporaryDirectory() as t:
+            home = str(Path(t).resolve())
+            for d in ['.asdf/shims', 'brew/bin', 'brew/Cellar', 'son/bin', 'bin', '.config/x/bin']:
+                (Path(home) / d).mkdir(parents=True)
+            (Path(home) / 'brew/Cellar/tool').write_text('')
+            (Path(home) / 'brew/bin/tool').symlink_to('../Cellar/tool')
+            (Path(home) / 'son/auth.json').write_text('secret')
+            (Path(home) / 'son/bin/son').write_text('')
+            path = ':'.join([home + '/.asdf/shims', home + '/brew/bin', home + '/son/bin', home + '/bin',
+                             home + '/.config/x/bin', '/usr/bin', home + '/missing', 'relative'])
+            # Whole tree only for shims/symlink farms; never a sibling auth.json,
+            # the home directory or a credential tree.
+            self.assertEqual(ds.host_tools(path, home),
+                             [home + '/.asdf', home + '/brew', home + '/son/bin', home + '/bin'])
+
     def test_openvpn_copy_and_permissions(self):
         with tempfile.TemporaryDirectory() as t:
             p = Path(t)

@@ -722,6 +722,33 @@ def tool_path(value, home):
     return str(p)
 
 
+def host_tools(path, home):
+    """Tool trees for the host PATH entries outside /usr (the --host-tools opt-in)."""
+    found = []
+    for entry in dict.fromkeys(x for x in path.split(':') if x.startswith('/')):
+        p = Path(entry)
+        real = str(p.resolve())
+        # /usr is always mounted; snaps need the host snapd and cannot run here.
+        if not p.is_dir() or real == '/usr' or real.startswith(('/usr/', '/snap/', '/var/lib/snapd/')):
+            continue
+        # Mount the directory itself unless its commands live in the surrounding
+        # installation (asdf shims, Homebrew symlinks into Cellar). Widening by
+        # default would expose siblings such as a tool's auth.json.
+        parent = str(p.parent.resolve()) + '/'
+        widen = p.name == 'shims' or any(
+            x.is_symlink() and str(x.resolve()).startswith(parent) and not str(x.resolve()).startswith(real + '/')
+            for x in p.iterdir())
+        for candidate in ([p.parent] if widen else []) + [p]:
+            try:
+                found.append(tool_path(str(candidate), home))
+                break
+            except Error:
+                continue
+        else:
+            print(f'--host-tools: skipped {entry} (not allowed as a tool mount)', file=sys.stderr)
+    return found
+
+
 def allocate():
     used = {c['transport'][0] for c in configs() if 'transport' in c}
     routes = json.loads(run(['ip', '-j', 'route', 'show', 'table', 'all']).stdout)
@@ -749,6 +776,8 @@ def create(args, user, context):
         if Path(p).exists():
             tools.append(tool_path(p, user.pw_dir))
     tools += [tool_path(p, user.pw_dir) for p in args.tool]
+    if args.host_tools:
+        tools += host_tools(context.get('path', SYSTEM_PATH), user.pw_dir)
     publish = []
     for p in args.publish:
         a, b = map(int, p.split(':'))
@@ -787,6 +816,7 @@ def parser():
     c = sub.add_parser('create', help='Create persistent private state (default network: off)')
     c.add_argument('name'); c.add_argument('--mount', action='append', default=[], metavar='SOURCE:TARGET[:ro|rw]')
     c.add_argument('--tool', action='append', default=[], metavar='PATH', help='Explicit read-only host installation tree at the same absolute path')
+    c.add_argument('--host-tools', action='store_true', help='Also mount, read-only, the installation tree of every host PATH entry outside /usr; inspect NAME lists them')
     c.add_argument('--shell-rc', help='Reviewed reusable Bash customization file (explicit trust/import)')
     c.add_argument('--cwd'); c.add_argument('--net', choices=['off', 'direct'], default='off')
     c.add_argument('--dns', action='append', metavar='IPv4'); c.add_argument('--allow-net', action='append', default=[], metavar='CIDR')
