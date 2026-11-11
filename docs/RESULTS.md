@@ -3,6 +3,50 @@
 Newest first. Each section separates what was executed from what was not
 established. The original build's results (2026-11-03) follow unchanged.
 
+## 2026-11-11: directory activation (feature 2, version 0.3.0)
+
+Same host as below. **30 acceptance groups passed, 0 failed** (14 original,
+S1-S8, A1-A8); parser and unit tests **13 passed**. Evidence:
+[`tests/acceptance.log`](../tests/acceptance.log),
+[`tests/results.json`](../tests/results.json). Source and installed copy match.
+
+| Requirement | Executed evidence |
+|---|---|
+| Resolution from scripts, nearest marker wins | A1: name-less `exec`, `status`, `resolve` and the `.` placeholder resolve from nested subdirectories and through a symbolic-link directory; an unapproved nearer marker is an error (119), not a fall-through; no marker is 121 |
+| Nothing takes effect before approval of exact path and content | A1: unapproved marker gives 119 and the command did not run; appending a comment, retargeting to another session and `deny` each revoke; restoring the exact bytes restores |
+| Approval shows what is granted; record outside the tree | A1: `allow` output contains the marker path, the session's mount, network mode and environment variable names, never a value; refuses without a terminal or `--yes`; refuses a marker whose session does not exist; the record is a byte copy under the state directory with mode 0600 and the tree's file list is unchanged |
+| Marker is declarative data | A1: ten hostile markers (command substitution, `;`, backticks, `mount =`, `net =`, two sessions, escape sequence, 5000 bytes, traversal, empty) and a symbolic link to an approved marker are refused by `resolve`, `exec` and `allow`; the file their payload would create does not exist |
+| Hook: enter at the same path | A2 (real PTY): `cd` into an approved tree gives the session prompt at `/workspace/sub` for a project mounted at a different path; also through a symbolic link |
+| Hook: exit | A2: `exit` returns to the host prompt in the same directory; three further prompts and a `cd` within the tree do not re-enter; leaving and returning re-enters |
+| Hook: leave | A3: `cd /tmp` inside the session ends its shell and the host shell is in `/tmp`; with a same-path mount `cd ../..` lands in the tree's parent; a session-only directory is reported once and the host shell stays |
+| Hook: nested | A4: entering a subdirectory with its own marker hands over to that marker's session and back on `cd ../..`; `exit` in the nested session skips only the nested tree |
+| Never re-enter from inside | A1/A4: name-less `exec` and `shell` inside a session exit 125; evaluating the hook there installs nothing |
+| Hook: unapproved, edited after approval | A5/A6: reported exactly once, never entered, `exec` gives 119; `allow` (or restoring the bytes) takes effect at the next prompt |
+| Auto-entry can be switched off; scripts unaffected | A7: `DEVSESSION_AUTO_ENTER=0` and a shell without the hook stay on the host while name-less `exec` still resolves. A1: a non-interactive shell that evaluates the hook has an empty `PROMPT_COMMAND`. S1-S8 unchanged |
+| Hook is fast, silent, no sudo | A8: **84 microseconds per prompt** in an unmarked directory six levels deep (20000 calls); `strace -f -c` shows the same number of process creations for 1 and 2001 calls, i.e. none per prompt; A2 asserts no notice text in an approved flow |
+
+Found by these checks and fixed: none in the product beyond first-run test
+corrections (a strace column mis-parse and a test that expected re-entry
+inside a tree it had just exited).
+
+### Not established (feature 2)
+
+- Only Bash 5.3 was exercised. The hook uses `[[ ]]`, arrays and
+  `read -d ''`; older Bash (before 5.1, where `PROMPT_COMMAND` arrays arrived
+  for the session side) was not tested. No zsh/fish integration exists.
+- Prompt frameworks: the PTY checks use plain prompts. Coexistence with
+  oh-my-posh's `PROMPT_COMMAND` on the host and in the session is by
+  construction (prepend, preserve `$?`) and was not driven on a PTY.
+- A session shell with stopped jobs refuses the first `exit` issued by the
+  leave function (Bash's own safeguard); not exercised.
+- The hand-back path is validated and only ever passed to `cd`; a hostile
+  session steering the host shell into another *approved* tree was reasoned
+  about (it can only cause an entry the user already approved), not attacked.
+- Sudo credential prompts during hook entry (password-required sudo on a
+  terminal) were not driven; this host has passwordless sudo.
+- Approval-store behaviour on network home directories or with very long
+  paths (near `PATH_MAX`) was not tested.
+
 ## 2026-11-11: scripting support (feature 1, version 0.2.0)
 
 Host: Ubuntu 26.04, Linux 7.0.0-34, Python 3.14.4, Bash 5.3.9, sudo-rs 0.2.13

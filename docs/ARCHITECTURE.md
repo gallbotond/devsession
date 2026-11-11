@@ -196,6 +196,76 @@ requirements left open, with the reason for each:
 - **The Python client is a CLI client.** `examples/devsession_client.py` only
   runs `devsession` and reads its documented status, JSON and status file.
 
+## Directory activation: decisions and reasons
+
+Feature 2 (0.3.0) binds a directory tree to a session through a marker file.
+
+- **Who parses what.** The marker is read, parsed and compared with its
+  approval by the unprivileged front end, as the invoking user. The privileged
+  side receives three strings in `DEVSESSION_CONTEXT`: a session name
+  (validated by the same pattern as any name), the marker's directory and the
+  current directory. It parses nothing from the repository. A user could put
+  any name there, exactly as they could type it; approval protects against
+  untrusted *content*, not against the user.
+- **The marker cannot describe a session.** Whether a marker may also say how
+  to create a missing session was left open. It may not: mounts, tool trees
+  and network modes are host grants, and a repository-supplied request for
+  them turns "approve this repository" into "grant this repository host
+  access" behind one confirmation. Creation stays an explicit `create`. For
+  the same reason `allow` refuses a marker whose session does not exist:
+  there would be nothing to show.
+- **Approval is a byte-exact copy, keyed by physical path.** The record for
+  `/a/b/.devsession` is `$XDG_STATE_HOME/devsession/allow/a/b/.devsession`.
+  A copy (rather than a hash) lets the Bash hook compare with builtins and no
+  process; mirroring the path (rather than hashing it) needs no process
+  either. The CLI re-checks with exact bytes on every use, so the hook's
+  comparison is an optimisation, never the authority. Exit status 119 is new
+  for "not approved", extending the reserved band downward.
+- **The approval store is user-owned.** The approver is the user; anything
+  running as the user on the host can already name any session. Keeping
+  records user-readable is what lets the hook work without sudo. The store,
+  and any directory containing it, is refused as a mount source so that a
+  session cannot write approvals.
+- **Nearest marker wins, including when unapproved.** Falling through to an
+  outer approved marker would run a subtree's commands in a session its own
+  marker did not name.
+- **Same place = mapping through mounts.** The host directory maps to
+  `target + (dir - source)` of the longest matching mount. No mapping means
+  failure (120), not the session's default directory: a script that runs
+  `make` in the wrong tree is worse than one that stops.
+- **Inside a session, "the tree" is a list of session paths**: every mount
+  target (or sub-path of one) whose source lies in the marked tree. The
+  hook-entered shell leaves when its directory is outside all of them, or is
+  under a nearer marker below a tree root.
+- **Leaving hands back one path.** The session-side prompt function writes its
+  directory to a file in the session's private runtime directory and exits.
+  Root reads that file as untrusted input (no symlink following, must be a
+  regular file owned by the session UID, at most 4096 bytes, one printable
+  absolute path without `..`), maps it back through the mounts and writes the
+  result, with the user's own rights, to a file the hook named inside the
+  user's 0700 state directory. The host hook does `cd` there if it is a
+  directory and re-evaluates. The session can therefore influence where the
+  host shell stands, and nothing else; nothing is evaluated.
+- **Exit versus leave.** `exit` produces no hand-back, so the hook marks that
+  tree as skipped until the host shell leaves it; otherwise every prompt would
+  re-enter. A failed entry is treated the same way. At most eight consecutive
+  hand-backs are followed, and none to the directory just left.
+- **The session-side file is root-written.** `/etc/devsession-activate.bashrc`
+  is generated into the session's read-only `/etc` at start and sources the
+  session's own customization first. It is used only for hook-entered shells,
+  so `devsession shell NAME` behaves as before.
+- **Never from inside.** The front end refuses directory resolution when
+  `DEVSESSION` is set (125) and the hook does not install there. This is a
+  guard against confusion, not a boundary: inside a session there is no sudo
+  to enter anything with.
+- **Direct-root callers must name the session.** Approval records belong to a
+  user's state directory; a root service is not asked to read them.
+- **Cost.** The hook walks from the working directory to `/` testing for the
+  marker and for symbolic-link components with `[[ ]]`. It starts a process
+  only to resolve a symlinked path (`pwd -P`) or to enter. Measured by A8:
+  about 85 microseconds per prompt six levels deep, and zero processes for
+  2000 prompts.
+
 ## Limits
 
 This is not a VM-equivalent hostile-workload boundary. The kernel is shared;

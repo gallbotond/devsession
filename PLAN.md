@@ -78,9 +78,18 @@ Result: unit tests 9 passed; acceptance 22 groups passed, 0 failed; no
 leftovers (namespaces, nft tables, throwaway user, sudoers file). Not
 established: see "Not established (feature 1)" in `docs/RESULTS.md`.
 
-### Feature 2: directory activation
+### Feature 2: directory activation (done 2026-11-11, version 0.3.0)
 
-- [ ] Not started
+- [x] Marker `.devsession` (`session = NAME` only), parsed as data by the unprivileged front end
+- [x] `allow` / `deny` / `resolve`; approval = byte copy under `$XDG_STATE_HOME/devsession/allow/<path>`; exit 119
+- [x] Name-less `exec --`, `shell`, `start`, `stop`, `status`, `inspect`; `.` placeholder everywhere; cwd mapped through mounts
+- [x] `devsession hook bash`: builtins only per prompt; enter, exit (skip until tree left), leave (hand-back path), nested
+- [x] Session-side `/etc/devsession-activate.bashrc`; no entry from inside a session; approval store unmountable
+- [x] Decision: a marker cannot describe session creation (rationale in ARCHITECTURE.md)
+- [x] Acceptance group `activation` (A1-A8, `tests/accept_activation.py`), PTY-driven; hook cost measured
+- [x] Docs, installed copy matches source, pushed
+
+Result: unit tests 13 passed; acceptance 30 groups passed, 0 failed.
 
 ### Feature 3: Tailscale
 

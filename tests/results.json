@@ -89,8 +89,8 @@
           "11.20.0"
         ]
       },
-      "/tmp/opencode/devsession-accept-oy_2h10d/project/.venv/bin/python": {
-        "path": "/tmp/opencode/devsession-accept-oy_2h10d/project/.venv/bin/python",
+      "/tmp/opencode/devsession-accept-9jx3ashw/project/.venv/bin/python": {
+        "path": "/tmp/opencode/devsession-accept-9jx3ashw/project/.venv/bin/python",
         "realpath": "/usr/bin/python3.14",
         "version": [
           "Python 3.14.4"
@@ -193,5 +193,45 @@
     "check": "S8 legacy state migration check (prototype)",
     "status": "passed",
     "detail": "legacy prototype listed, inspected, stopped and cleaned up; files byte-identical"
+  },
+  {
+    "check": "A1 marker resolution, approval by exact path and content, marker is inert data",
+    "status": "passed",
+    "detail": "no marker 121; unapproved/changed 119; nearest wins; edit, retarget and deny revoke; 10 hostile markers and a symlink refused as data; record outside the tree"
+  },
+  {
+    "check": "A2 hook on a PTY: enter and exit",
+    "status": "passed",
+    "detail": "cd into an approved tree enters at the mapped path; exit returns to the host shell without re-entry until the tree is left"
+  },
+  {
+    "check": "A3 hook on a PTY: leaving the tree from inside the session",
+    "status": "passed",
+    "detail": "leaving the tree inside the session ends its shell and the host shell follows to the mapped directory"
+  },
+  {
+    "check": "A4 hook on a PTY: nested markers; never re-enter from inside",
+    "status": "passed",
+    "detail": "nearest marker wins across nesting in both directions; no entry from inside a session"
+  },
+  {
+    "check": "A5 hook on a PTY: unapproved marker",
+    "status": "passed",
+    "detail": "an unapproved marker is reported once and never entered; approval takes effect at the next prompt"
+  },
+  {
+    "check": "A6 hook on a PTY: marker edited after approval",
+    "status": "passed",
+    "detail": "an edit after approval blocks entry and resolution until the marker is approved again or restored"
+  },
+  {
+    "check": "A7 hook on a PTY: auto-entry disabled",
+    "status": "passed",
+    "detail": "DEVSESSION_AUTO_ENTER=0 (or no hook) leaves interactive shells alone; name-less commands still resolve"
+  },
+  {
+    "check": "A8 measured hook cost on an unmarked directory",
+    "status": "passed",
+    "detail": "84 microseconds per prompt in an unmarked directory 6 levels deep; 0 processes started by 2000 prompts"
   }
 ]

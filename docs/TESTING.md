@@ -78,6 +78,35 @@ network mode off, so this group needs no lab servers.
 - S8: the legacy `prototype` session is listed, inspected and reported
   stopped, and its files are byte-identical afterwards.
 
+## Directory-activation checks (group `activation`, `tests/accept_activation.py`)
+
+Sessions `act-a` (project mounted at `/workspace`) and `act-b` (two trees
+mounted at their own paths), network mode off. Approval records go to a
+temporary `XDG_STATE_HOME`; the invoking user's own approvals are untouched.
+A1 runs without a terminal. A2-A7 drive an interactive `bash --norc -i` on a
+real PTY with the hook evaluated, synchronising on the host and session
+prompts.
+
+- A1: no marker (121), unapproved (119, and the command did not run), `allow`
+  output lists exactly the session's mounts/network/environment names and no
+  values; the record is a byte copy outside the tree with mode 0600 and the
+  tree's file list is unchanged; mapped working directory, symbolic-link
+  directory, `.` placeholder, `--cwd` override; nearest marker wins when it is
+  the unapproved one; edit, retarget and `deny` revoke, restoring the bytes
+  restores; ten hostile markers (command substitution, extra keys such as
+  `mount =`, two sessions, escape sequences, oversize, traversal, empty) and a
+  symbolic-link marker are refused and nothing they name is created; a marker
+  for a missing session cannot be approved; an unmounted marked directory
+  fails; no resolution from inside a session (125) or for a root service
+  (121); the approval store cannot be mounted; a non-interactive shell that
+  evaluates the hook gets no prompt function.
+- A2 enter/exit, A3 leave (different-path mount, same-path mount, a
+  session-only directory), A4 nested in both directions plus the in-session
+  refusal, A5 unapproved (reported once, approval effective at the next
+  prompt), A6 edited after approval, A7 `DEVSESSION_AUTO_ENTER=0` and no hook.
+- A8: 20000 hook calls timed in an unmarked directory six levels deep, and
+  `strace -f -c` process-creation counts compared between 1 and 2001 calls.
+
 ## Topology
 
 - `dslab-a`: WireGuard UDP/51820 at 198.18.10.2, private 10.77.0.1.

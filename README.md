@@ -200,14 +200,15 @@ CI or Python. Working examples, executed by the acceptance suite:
 this command line, not a second implementation).
 
 **Exit status.** `exec` and `shell` return the command's own status. devsession
-reserves 120-125 for itself, so a command exiting 1 or 2 is never mistaken for
+reserves 119-125 for itself, so a command exiting 1 or 2 is never mistaken for
 a tool failure (`devsession version --json` prints this table):
 
 | Status | Meaning |
 |---|---|
 | 0 | Success; for `exec`/`shell` the command exited 0 |
-| 1 | `exists`: no such session. `doctor`: a required prerequisite is missing |
+| 1 | `exists`: no such session. `resolve`: no marker. `doctor`: a required prerequisite is missing |
 | 3 | `status`: the session exists but is stopped |
+| 119 | The directory marker is not approved, or changed after approval |
 | 120 | devsession failed: operation error, bad working directory, interrupted join |
 | 121 | Usage error (was argparse's 2) |
 | 122 | No such session |
@@ -218,7 +219,7 @@ a tool failure (`devsession version --json` prints this table):
 | 128+N | `exec`/`shell`: the command was killed by signal N |
 | other | `exec`/`shell`: the command's own status |
 
-A command can itself exit 120-125. When that matters, `exec --status-file FILE`
+A command can itself exit 119-125. When that matters, `exec --status-file FILE`
 writes one JSON record: `{"source": "command"|"devsession", "exit_code": N,
 "signal": N|null, "error": KIND|null}`. `source` is `command` only if the
 command ran and this is its status. The file is emptied first; if it is still
@@ -284,6 +285,87 @@ caller therefore needs one of:
 
 There is still no setuid helper and no restricted sudo rule: a sudoers entry
 limited to `/usr/local/bin/devsession` is root-equivalent, not a restriction.
+
+## Directory activation
+
+Tie a directory tree to a session, direnv-style, so that working there uses
+that session without naming it. A marker file `.devsession` holds one line of
+data ([example](examples/dot-devsession)):
+
+```sh
+cd ~/projects/app
+devsession create client-a --mount "$PWD:/workspace"
+echo 'session = client-a' > .devsession
+devsession allow            # shows what the binding grants, asks, records the approval
+```
+
+**Resolution (scripts and terminals alike).** A command given no session name,
+or `.` in its place, uses the nearest marker at or above the current
+directory:
+
+```sh
+devsession exec -- make test          # runs in client-a, in /workspace/<same subdirectory>
+devsession status                     # also start, stop, inspect, shell
+devsession env set . REGION eu-west-1 # "." works wherever a name is expected
+devsession resolve                    # prints client-a; exit 0, 1 (no marker) or 119 (not approved)
+```
+
+`exec` and `shell` start in the same place as the session sees it: the host
+directory mapped through the session's mounts (a project mounted at
+`/workspace` maps `~/projects/app/api` to `/workspace/api`). If the directory
+is not mounted in that session the command fails (120) rather than running
+somewhere else; `--cwd` overrides. `exec` needs the `--` when the name is
+omitted. `delete` and `exists` never take the session implicitly (use `.`).
+
+**Trust.** A marker arrives with whatever repository you clone, so it is
+untrusted input and does nothing until approved:
+
+- `devsession allow [DIR]` prints the marker path and SHA-256, the session it
+  names and what that session holds (network mode, mounts, tool trees,
+  environment names, published ports), then asks. `--yes` skips the question
+  for scripts. The session must already exist, so there is always something
+  to show.
+- The approval is an exact copy of the marker stored outside the tree, under
+  `${XDG_STATE_HOME:-~/.local/state}/devsession/allow/<path>`. It covers that
+  path and those bytes only: any edit, including retargeting it to another
+  session, revokes it (status 119) until you approve again. `devsession deny`
+  revokes explicitly. That store can never be mounted into a session.
+- The nearest marker always decides. An unapproved marker in a subdirectory is
+  an error there, not a fall-through to an approved one further up.
+- A marker is declarative data with a single key, `session`. It is never
+  sourced or executed; shell syntax, extra keys (it cannot declare mounts,
+  tools, networking or how to create a session), symbolic links, control
+  characters and anything over 4 KiB are rejected. It holds no secrets.
+- Approval binds a name. What the session of that name holds is changed only
+  by your own `devsession` commands, shown again at the next `allow`.
+
+**Shell hook.** In `~/.bashrc`:
+
+```sh
+eval "$(devsession hook bash)"
+```
+
+In an interactive Bash, `cd` into an approved tree enters the session's shell
+at the same (mapped) path. `exit` returns to the host shell, which then stays
+on the host until you leave that tree. Changing directory out of the tree
+*inside* the session also ends the session shell, and the host shell follows
+to that directory: its host path if it lies under a mount, otherwise the same
+absolute path if that exists on the host. A nearer marker in a subdirectory
+hands over to its own session, and back again on the way out. An unapproved
+or edited marker is reported once and never entered.
+
+- The hook runs at every prompt using shell builtins only: no sudo and no
+  process unless a session is actually entered (measured: about 85
+  microseconds per prompt in an unmarked directory). Entering runs
+  `devsession shell`, which needs sudo like any other entry.
+- It installs itself only in interactive shells; scripts and non-interactive
+  shells behave exactly as described under Scripting.
+- `DEVSESSION_AUTO_ENTER=0` switches automatic entry off (per shell, or
+  exported from `~/.bashrc`); name-less commands still resolve.
+- Nothing is ever entered from inside a session: the hook does not install
+  there, and name-less commands fail with 125.
+- Only Bash is supplied. Sessions started before 0.3.0 need one restart for
+  leave detection.
 
 ## Lifecycle, servers and cleanup
 

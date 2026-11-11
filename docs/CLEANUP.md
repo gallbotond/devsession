@@ -77,5 +77,20 @@ sudo pkill -KILL -u dvs-pwtest; sudo userdel -r dvs-pwtest
 sudo rm -f /etc/sudoers.d/dvs-pwtest
 ```
 
+## Directory activation
+
+Approvals are per user, outside any project tree. To forget all of them, and
+to remove the shell integration:
+
+```sh
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/devsession"
+# delete the line  eval "$(devsession hook bash)"  from ~/.bashrc
+```
+
+`.devsession` marker files belong to their projects and are left alone. The
+`activation` acceptance group uses sessions `act-a`/`act-b` and a temporary
+directory `/tmp/devsession-activation-*` that also holds its approval store;
+after an interrupted run delete those sessions and that directory.
+
 The legacy session `prototype` (`/var/lib/devsession/prototype`) predates
 this work and is deliberately left in place as the state-migration check.
