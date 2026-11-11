@@ -29,8 +29,21 @@ a host Unix socket and a host tmux session named `ds-host-sentinel`.
 python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 sudo python3 -B tests/prototype.py
 python3 -B tests/acceptance.py | tee tests/acceptance.log
-python3 -B tests/acceptance.py scripting      # one group only: core, scripting
+python3 -B tests/acceptance.py scripting      # one group only: core, scripting, activation, tailscale
 ```
+
+The `tailscale` group additionally needs the host `tailscale` package (its
+own daemon may be running and logged in; it is only read) and the headscale
+release binary, which is a test fixture and not part of the runtime:
+
+```sh
+mkdir -p /tmp/opencode/hs && cd /tmp/opencode/hs
+curl -fsSLo headscale https://github.com/juanfont/headscale/releases/download/v0.29.7/headscale_0.29.7_linux_amd64
+echo 'e827fc9b12d958bc95b081c4401dd63f8e0471d025b45b508535a920532150a8  headscale' | sha256sum -c - && chmod +x headscale
+```
+
+Set `HEADSCALE=/path/to/headscale` to use another location. Without the
+binary the group fails at lab start; the other groups are unaffected.
 
 `prototype.py` is the initial architecture gate, retained as an executable
 demonstration. It exercises the actual host Terraform, Ansible, tmux and
@@ -107,6 +120,96 @@ prompts.
 - A8: 20000 hook calls timed in an unmarked directory six levels deep, and
   `strace -f -c` process-creation counts compared between 1 and 2001 calls.
 
+## Tailscale checks (group `tailscale`, `tests/accept_tailscale.py`)
+
+A private tailnet next to the other fixtures, built by `tests/lab.py`:
+
+- `dslab-hs` (198.18.20.2): headscale 0.29.7 as control server with its
+  embedded DERP relay (TCP 8443, TLS from a CA generated for the run) and
+  STUN (UDP 3478). MagicDNS base domain `lab.devsession.test`, split DNS for
+  `vpn.test` to the peer's resolver, no global resolvers.
+- `dslab-ts` (198.18.21.2): an ordinary tailscaled peer `lab-peer`
+  (100.64.0.1) with HTTP on 8080 and dnsmasq on its tailnet address,
+  advertising subnet 10.78.0.0/24 and offering an exit node, both approved.
+  It reaches the control server over a lab-internal link, so the fixture does
+  not depend on IPv4 forwarding in the host namespace.
+- The peer daemon and every CLI call use the same private-mount launcher as
+  session daemons, so the fixture cannot touch the host's tailscaled either.
+
+Sessions: `ts-a` (MagicDNS, `--accept-routes`), `ts-n` (explicit `--dns`, no
+routes), `ts-x` (exit node), `ts-o` (one-time key), `ts-p` (policy and
+blocked-control cases), `ts-w`/`ts-v` (WireGuard and OpenVPN, concurrently).
+
+- T1: options that would expose the gateway do not exist (121); malformed
+  values are refused without echoing them; a key given on stdin is stored
+  0600 root, absent from `inspect` and from every other state file.
+- T2: the session is its own node; tailnet HTTP, MagicDNS, split DNS through
+  the tunnel and an accepted subnet route work; the detector, 1.1.1.1, an
+  outside name and the host itself are unreachable with forward-drop
+  counters rising; routes not accepted stay unreachable; the auth key never
+  appears in a process listing sampled throughout start.
+- T3: with an exit node the independent detector sees the exit node's
+  address; a sibling session without one still cannot reach it.
+- T4: WireGuard, OpenVPN and two Tailscale sessions at once, the same name
+  `vpn.test` answered by four different tunnels.
+- T5: for each session daemon: a mount namespace different from the host's,
+  `/etc` bound from session state, `/run` without dbus/systemd/
+  NetworkManager/tailscale, no host tailscaled state visible, own socket,
+  state directory, `vpn0` and port; only `inet guard` and `ip nat` tables in
+  the gateway; preferences read back (SSH off, shields up, nothing
+  advertised, netfilter off, nothing served); no socket or state visible to
+  workloads; 100.100.100.100 closed except DNS; a marked UDP packet to
+  1.1.1.1:53 sent from the gateway namespace is dropped and counted; from the
+  peer, HTTP to a workload listener, ping and TCP 22 to the node all fail;
+  the host snapshot is identical while two session daemons run.
+- T6: a control server in a blocked private range without `--transport-net`:
+  start fails closed and leaves no namespace or table.
+- T7/T8: capture at the host transport link across: daemon killed, logged
+  out, node key expired by the control server, and (T8) the exit node killed
+  and restarted, each followed by probes and by stop/start. Probes are UDP
+  with a marker to the detector, 1.1.1.1:53, the control, relay, STUN and peer
+  ports and an IPv6 resolver, plus HTTP and DNS attempts. The capture must
+  hold transport packets, no marker, no port 53, no port 8080 and no IPv6;
+  forward-drop counters must be positive in each state.
+- T9: a one-time key: same node ID and address after stop/start; `delete`
+  reports `tailscale_logout: true` and the control server shows the node
+  expired or gone, for a running and for a stopped session.
+- T10: after teardown, seventeen host snapshots taken before any fixture
+  existed are compared byte for byte: `tailscale debug prefs`, the host
+  node's and every peer's identity fields from `tailscale status --json`, the
+  first four columns of `tailscale status`, the tailscaled unit's PID and
+  start time, `ip rule`, `ip -6 rule`, all IPv4 and IPv6 routing tables,
+  table 52, `nft -s list ruleset` (and, for the mid-run comparison in T5, the
+  same ruleset without devsession's own `ds_*` tables), `/etc/resolv.conf`
+  (content and link),
+  systemd-resolved's two resolver files, `resolvectl dns` and
+  `resolvectl domain`. The verbatim `tailscale status` text is also compared
+  and its result reported, but not required: its activity column (traffic
+  counters, "idle"/"active", last seen) changes on a live tailnet on its own.
+
+## Real-internet run (`tests/remote_tailscale.py`)
+
+Not part of `acceptance.py`; it needs a second machine with a public IPv4
+address. `tests/remote_vm_setup.sh PUBLIC_IP` (as root on that machine)
+downloads headscale and the static tailscale build with checksums, generates
+a CA, server certificate and auth keys there, starts headscale (control,
+DERP, STUN) and one peer offering an exit node with a 20 MiB test file, and
+prints the CA certificate and a client key. Open TCP 8443, UDP 3478 and UDP
+41641 to it from the test host only. Then, on the test host:
+
+```sh
+python3 -B tests/remote_tailscale.py --server https://PUBLIC_IP:8443 --ca ca.crt \
+    --auth-key-file client.key --peer-ip 100.64.0.1 --vm-ip PUBLIC_IP \\
+    --peer-private-ip REMOTE_LAN_IP --blob-sha256 HEX
+```
+
+R1 join; R2 public egress address through the exit node equals the remote
+machine's and differs from the host's; R3 direct or relayed path; R4 DF pings
+at and above the tunnel MTU, a fragmented ping and a 20 MiB transfer checked
+by SHA-256; R5 kill switch; R6 capture restricted to the remote address with
+no DNS or cleartext; R7 host unchanged. `tests/remote_vm_cleanup.sh PUBLIC_IP`
+removes everything on the remote machine and prints what is left.
+
 ## Topology
 
 - `dslab-a`: WireGuard UDP/51820 at 198.18.10.2, private 10.77.0.1.
@@ -144,6 +247,23 @@ devsession exec lab-demo -- curl http://vpn.test:8080
 devsession delete lab-demo
 sudo python3 -B tests/lab.py down
 devsession cleanup
+```
+
+With the tailnet fixture (`up tailscale` needs the headscale binary):
+
+```sh
+sudo python3 -B tests/lab.py up tailscale
+L=/tmp/opencode/devsession-lab
+devsession create ts-demo
+devsession vpn configure ts-demo --tailscale --auth-key-file $L/ts-authkey \
+    --login-server https://198.18.20.2:8443 --ca-file $L/ts-ca.crt \
+    --transport-net 198.18.20.0/30 --transport-net 198.18.21.0/30 --exit-node lab-peer
+devsession net set ts-demo vpn
+devsession exec ts-demo -- curl http://198.18.12.2:8080     # source is the exit node, 198.18.21.2
+sudo python3 -B tests/lab.py peer status                    # the lab peer's own tailscale CLI
+sudo python3 -B tests/lab.py hs nodes list                  # headscale CLI, JSON
+devsession delete ts-demo
+sudo python3 -B tests/lab.py down
 ```
 
 The generated VPN configs/keys are root-only. The CLI's root importer reads

@@ -91,6 +91,33 @@ established: see "Not established (feature 1)" in `docs/RESULTS.md`.
 
 Result: unit tests 13 passed; acceptance 30 groups passed, 0 failed.
 
-### Feature 3: Tailscale
+### Feature 3: Tailscale (done 2026-11-11, version 0.4.0; hosted-service check unverified)
 
-- [ ] Not started
+Design summary (details and reasons: `docs/ARCHITECTURE.md`, "Tailscale
+backend"): per-session `tailscaled` in the gateway namespace, launched inside
+`TS_BOX` (private mount namespace: own `/etc`, empty `/run`, hidden
+`/var/lib/tailscale`, read-only `/usr`); gateway OUTPUT on `wan` = the
+daemon's transport (TCP/UDP, never port 53), FORWARD still `lan -> vpn0`
+only; `--netfilter-mode=off`, shields up, preferences reset and verified at
+every start; exit node selected after login and before workloads.
+
+- [x] `vpn configure --tailscale` (auth key file/stdin, login server, CA, exit node, accept routes, DNS, hostname, transport nets)
+- [x] `TS_BOX` launcher for the daemon and every CLI call; private `/etc`, pinned control host, no resolver
+- [x] nft rules for the backend; private ranges (and the host tailnet) stay blocked; quad-100 limited to DNS
+- [x] Start: login with `--auth-key=file:`, preference verification, exit node after login; `delete` logs out (bounded)
+- [x] Hermetic lab in `tests/lab.py`: headscale 0.29.7 + DERP/STUN in `dslab-hs`, peer in `dslab-ts`
+- [x] Acceptance group `tailscale` (T1-T10, `tests/accept_tailscale.py`)
+- [x] Real-internet run on the remote VM (`tests/remote_tailscale.py`): R1-R7 passed; VM cleaned up and verified
+- [ ] Hosted Tailscale interoperability: needs `TS_AUTHKEY` for a throwaway tailnet; not set in this session, so unverified
+- [x] Full suite in one run: 40 groups passed, 0 failed; unit tests 16 passed; docs, installed copy matches source, pushed
+
+Remote VM bookkeeping: everything created for the run was removed and
+verified on 2026-11-11 (firewall rules `dvs-ts-test-allow`, `dvs-ts-test-iap`,
+`dvs-ts-test-noadmin`; access config `dvs-ts-test`, a temporary external IPv4
+on `free-vm` nic0; `/tmp/dvs-ts` and a loopback address on the VM). Nothing is
+left running or installed there.
+
+All three features are done. Open item for a later session, needing a
+credential: run `TS_AUTHKEY=... python3 -B tests/hosted_tailscale.py` with a
+key for a throwaway tailnet and record the result in `docs/RESULTS.md`.
+Other gaps are listed under "Not established" there.

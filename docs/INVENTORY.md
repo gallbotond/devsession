@@ -95,6 +95,20 @@ for every command or plugin of those tools. OpenCode's installation tree is
 available, but its host authentication is intentionally absent; authenticated
 OpenCode use inside a session requires independent credentials and was not tested.
 
+## Tailscale backend (2026-11-11)
+
+- The host already had the `tailscale` package (1.104.6) with its own
+  `tailscaled` running and logged in. devsession uses the two binaries only;
+  it starts separate daemons per session and never reads or changes the host
+  daemon's state, socket, preferences, routes or DNS settings. Tests read the
+  host daemon's status and preferences to assert that they are unchanged.
+- Test fixture only: the headscale 0.29.7 release binary, downloaded to
+  `/tmp/opencode/hs/headscale` with its published SHA-256 verified. It is not
+  installed system-wide and not needed at runtime.
+- `strace` (already present) is used by one activation check.
+- No package was installed for features 1-3. The scripting checks create and
+  remove a throwaway user `dvs-pwtest` and `/etc/sudoers.d/dvs-pwtest`.
+
 ## Repository publication
 
 At the user's request, installed Ubuntu's `gh` package (2.46.0-4) to publish

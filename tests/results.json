@@ -89,8 +89,8 @@
           "11.20.0"
         ]
       },
-      "/tmp/opencode/devsession-accept-9jx3ashw/project/.venv/bin/python": {
-        "path": "/tmp/opencode/devsession-accept-9jx3ashw/project/.venv/bin/python",
+      "/tmp/opencode/devsession-accept-2hxywf82/project/.venv/bin/python": {
+        "path": "/tmp/opencode/devsession-accept-2hxywf82/project/.venv/bin/python",
         "realpath": "/usr/bin/python3.14",
         "version": [
           "Python 3.14.4"
@@ -233,5 +233,72 @@
     "check": "A8 measured hook cost on an unmarked directory",
     "status": "passed",
     "detail": "84 microseconds per prompt in an unmarked directory 6 levels deep; 0 processes started by 2000 prompts"
+  },
+  {
+    "check": "T1 Tailscale configuration policy and secret handling",
+    "status": "passed",
+    "detail": "SSH/advertise/shields/netfilter/operator options do not exist (121); malformed values 120; key via stdin, mode 600, absent from inspect"
+  },
+  {
+    "check": "T2 own node: tailnet HTTP, MagicDNS, split DNS, accepted routes; nothing else reachable",
+    "status": "passed",
+    "detail": "joined in 2.6s as 100.64.0.2; tailnet HTTP, MagicDNS, split DNS and accepted route work; other destinations dropped"
+  },
+  {
+    "check": "T3 exit node: all IPv4 through it, DNS through it",
+    "status": "passed",
+    "detail": "exit node carries all IPv4 (detector sees the exit node's address); DNS resolved through it"
+  },
+  {
+    "check": "T4 concurrent WireGuard, OpenVPN and Tailscale sessions",
+    "status": "passed",
+    "detail": "WireGuard, OpenVPN and two Tailscale sessions concurrently, each on its own tunnel and gateway identity"
+  },
+  {
+    "check": "T5 daemon isolation from host DNS/D-Bus/tailscaled; gateway not exposed",
+    "status": "passed",
+    "detail": "private mount namespace with its own /etc and /run; own socket, state, vpn0 and port; no netfilter of its own; SSH/serve/inbound closed; host unchanged mid-run"
+  },
+  {
+    "check": "T6 private ranges stay blocked for the daemon",
+    "status": "passed",
+    "detail": "control server in a blocked private range unreachable for the daemon: start failed closed after 46s, nothing left behind"
+  },
+  {
+    "check": "T7 forced failure without exit node: kill, logout, key expiry, restart; capture and counters",
+    "status": "passed",
+    "detail": {
+      "drops_daemon_killed": 620,
+      "drops_logged_out": 312,
+      "drops_key_expired": 304,
+      "capture": "/tmp/opencode/ts-a-transport.pcap",
+      "packets": 425,
+      "control_or_relay_tls": 340,
+      "wireguard_or_stun_udp": 77
+    }
+  },
+  {
+    "check": "T8 forced failure with exit node, including loss of the exit node; capture and counters",
+    "status": "passed",
+    "detail": {
+      "drops_daemon_killed": 614,
+      "drops_logged_out": 310,
+      "drops_key_expired": 180,
+      "exit_node_lost": "no direct egress; recovered when the exit node returned",
+      "capture": "/tmp/opencode/ts-x-transport.pcap",
+      "packets": 1206,
+      "control_or_relay_tls": 372,
+      "wireguard_or_stun_udp": 826
+    }
+  },
+  {
+    "check": "T9 node state persistence, one-time key, logout on delete",
+    "status": "passed",
+    "detail": "one-time key: same node ID and address after stop/start; delete logged the node out, running or stopped"
+  },
+  {
+    "check": "T10 host tailscale status, routes, policy rules, table 52, nftables and resolver unchanged; no leftovers",
+    "status": "passed",
+    "detail": "17 host snapshots byte-identical (tailscale node/peers/prefs/process, rules, all routes, table 52, nft ruleset, resolver files, resolvectl); verbatim `tailscale status` text identical: False"
   }
 ]

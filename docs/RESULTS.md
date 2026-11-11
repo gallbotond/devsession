@@ -3,6 +3,119 @@
 Newest first. Each section separates what was executed from what was not
 established. The original build's results (2026-11-03) follow unchanged.
 
+## 2026-11-11: Tailscale backend (feature 3, version 0.4.0)
+
+Host as below, with tailscale 1.104.6 installed and the host's own tailscaled
+running and logged in to a real tailnet with 21 peers throughout. Control
+server for the tests: headscale 0.29.7.
+
+**40 acceptance groups passed, 0 failed** in one run (14 original, S1-S8, A1-A8,
+T1-T10); unit tests **16 passed**; the separate real-internet run **7 passed,
+0 failed**. Evidence: [`tests/acceptance.log`](../tests/acceptance.log),
+[`tests/results.json`](../tests/results.json),
+[`tests/remote.log`](../tests/remote.log),
+[`tests/remote-results.json`](../tests/remote-results.json), captures
+`/tmp/opencode/ts-a-transport.pcap`, `ts-x-transport.pcap`,
+`ts-vm-transport.pcap`. Source and installed copy match.
+
+### Hermetic lab (headscale + DERP/STUN in `dslab-hs`, peer in `dslab-ts`)
+
+| Requirement | Executed evidence |
+|---|---|
+| Own node through a per-session tailscaled; workloads reach tailnet peers | T2: joined in 2.6 s as 100.64.0.2; HTTP to the peer shows that address as source; T5: socket, state directory, `vpn0` and UDP port are the session's own and differ between two sessions (41700, 41701; never 41641) |
+| Not a full tunnel without an exit node | T2: detector, 1.1.1.1, an outside name and the host end of the link unreachable, forward-drop counter rising; a session without `--accept-routes` cannot reach the advertised subnet, one with it can |
+| Exit node: all IPv4 through it, loss fails closed | T3: the independent detector sees 198.18.21.2 (the exit node); T8: exit node killed while the session ran: detector and 1.1.1.1 unreachable, recovered without restart when it returned |
+| DNS is MagicDNS through the tunnel or explicit `--dns` | T2: workload resolver is 100.100.100.100; a tailnet name and a split-DNS name (answered by the peer's dnsmasq over the tunnel) resolve, an outside name fails; `--dns 100.64.0.1` works through the tunnel; T3: with an exit node names resolve through it. No packet to port 53 in any transport capture |
+| Host DNS protected structurally | T5: each daemon's mount namespace differs from the host's; its `/etc` is bound from session state; its `/run` has no dbus, systemd, NetworkManager or tailscale entry; host tailscaled state is not visible to it. The daemon did rewrite `resolv.conf`, its private one |
+| Host tailscaled and tailnet untouched | T5 (while two session daemons ran) and T10 (after teardown): 17 snapshots byte-identical, see `TESTING.md` for the list: host prefs, node and peer identity fields, tailscaled PID and start time, `ip rule`, all routing tables, table 52, `nft -s list ruleset`, resolver files and `resolvectl` |
+| Transport rule: only the daemon originates transport | T5: only `inet guard` and `ip nat` exist in the gateway (tailscaled added no chains); a marked UDP packet to 1.1.1.1:53 and packets to the host end (5351) and to multicast (1900) sent from the gateway namespace are dropped and counted; T7/T8 captures contain transport only |
+| Private ranges stay blocked for the daemon | T6: control server at 198.18.20.2 without `--transport-net`: start failed after the 45 s login timeout with status 120, no namespace or table left, no key in the message or log |
+| tailscaled cannot loosen the guard; kill switch on kill, logout, key expiry | T7 (no exit node) and T8 (exit node): after `kill -9`, `tailscale logout` and `headscale nodes expire`, HTTP, DNS and probes fail and the forward-drop counters stand at 620/312/304 and 614/310/180 packets; stop/start recovers each time. Captures (425 and 1206 packets, of which 340 and 372 TLS to control/relay): no probe marker, no port 53, no port 8080, no IPv6, nothing addressed to the host end |
+| Concurrent WireGuard and OpenVPN sessions | T4: four tunnels at once; `vpn.test` answered by server a, the OpenVPN server and the tailnet peer; detector sees 198.18.10.2, 198.18.13.2, 198.18.21.2 |
+| Nothing that exposes the gateway | T1: `--ssh`, `--advertise-routes`, `--advertise-exit-node`, `--shields-up=false`, `--netfilter-mode`, `--operator`, `--auth-key VALUE` are usage errors; T5: preferences read back (SSH off, shields up, nothing advertised, netfilter off, web client off), serve status empty; from the peer, HTTP to a workload listener, ping and TCP 22 to the node fail; 100.100.100.100 port 80 closed to workloads; workloads see no socket or state |
+| Unattended auth; secrets | T1/T2: key from a file and from stdin; stored 0600 root; absent from `inspect`, from every other state file and from process listings sampled throughout start; error messages do not echo a rejected key |
+| State persists; delete logs out | T9: a one-time key; same node ID and address after stop/start; `delete` reported `tailscale_logout: true` and headscale showed the node expired or gone, for a running and for a stopped session |
+| No leftovers | T10: no namespace, no `ds_*` table, no session or lab tailscaled, no headscale process |
+
+### Real internet (control server, relay and peer on the remote test VM)
+
+Executed once on 2026-11-11 from this host
+against GCP VM `free-vm`, us-east1 (temporary public address 35.229.110.22).
+All keys and the CA were generated on the VM; the client auth key and the CA
+certificate came from there, nothing secret went to it.
+
+| Check | Result |
+|---|---|
+| R1 join a tailnet whose control server and relay are on the public internet | joined the remote tailnet in 4.6s as 100.64.0.7; HTTP to the peer at 100.64.0.1 |
+| R2 distinct public egress IP: all IPv4 leaves at the remote exit node (HTTPS, name resolved through it) | public egress address through the exit node is 35.229.110.22; this host's own public address differs |
+| R3 transport path to the remote peer (direct UDP or DERP relay) | peer path: direct to 35.229.110.22:41641 |
+| R4 WAN path MTU discovery through the tunnel; bulk transfer integrity | UDP with DF: 1252-byte payload passes, 1253 is refused after the gateway reports the tunnel MTU (path MTU 1280); 20 MiB over TCP through the WAN tunnel in 3.4s with matching SHA-256 |
+| R5 kill switch on the real path | daemon killed: no direct egress, 317 forwarded packets dropped; restart resumed with the persisted node |
+| R6 transport capture: only encrypted traffic to the control/relay/peer address, no DNS, no cleartext | capture: /tmp/opencode/ts-vm-transport.pcap; packets: 6604; control_or_relay_tls: 138; wireguard_or_stun_udp: 6461; destinations: every packet toward the internet went to 35.229.110.22; private_candidates: 5 encrypted probes to the peer's private address reached the session link; none appeared on the uplink ens18 (host private-range rule, 3 drops since the last start) |
+| R7 host unchanged after the real-internet run; node logged out | host tailscale node/peers/prefs/process, rules, routes, table 52, nft ruleset and resolver byte-identical; node logged out on delete: True |
+
+This narrows the gap recorded for the original build: public-internet
+transport, a distinct public egress address and path-MTU behaviour over a WAN
+are now executed evidence **for the Tailscale backend**. They remain
+unverified for WireGuard and OpenVPN.
+
+Found by these runs and fixed before the final results:
+
+- With an exit node, tailscaled's default (LAN access disallowed) routed the
+  gateway's own `lan`/`wan` links into the tunnel and replies never returned.
+- tailscaled refuses to apply split-DNS routes without some base resolver;
+  an empty `resolv.conf` silently disabled them.
+- `up --exit-node=NAME` cannot name a peer before the first login.
+- The real-internet capture showed the daemon probing its default gateway,
+  the host end of the session link, for NAT-PMP port mappings. The host's
+  input rule already dropped them; the gateway now refuses traffic to the
+  host end and to multicast, and port mapping is disabled. Hermetic captures
+  assert it since.
+- The same capture showed encrypted probes to the peer's private LAN address
+  (a normal Tailscale candidate endpoint). The host's private-range rule
+  drops them; a capture on the uplink confirmed none left the machine.
+
+### VM state after the run
+
+Removed and verified: `/tmp/dvs-ts` (binaries, CA, keys, database), headscale,
+tailscaled and HTTP processes, the `tsdvs0` interface, the loopback address,
+`ip_forward` back to 0, no policy rules or `ts-` chains; firewall rules
+`dvs-ts-test-allow`, `dvs-ts-test-iap`, `dvs-ts-test-noadmin`; the temporary
+external IPv4 (access config `dvs-ts-test`). No package was installed. The VM
+is as found: running, no external IPv4, the original five firewall rules.
+Because the VM had no public IPv4, one was attached for about twenty minutes;
+a temporary deny rule kept SSH and RDP closed to the internet during that
+time while IAP access kept working.
+
+### Not established (feature 3)
+
+- **Tailscale's hosted control plane.** `TS_AUTHKEY` for a throwaway tailnet
+  was not set, so interoperability with the hosted service, its DERP network
+  and its default DNS behaviour was not executed.
+  `tests/hosted_tailscale.py` is prepared for it and has never been run.
+- Relayed (DERP-only) transport on the real path: the real run connected
+  directly. DERP was exercised only as far as each lab daemon's own home
+  connection.
+- A tailnet that configures DNS-over-HTTPS upstream resolvers: by design the
+  daemon would contact them over HTTPS outside the tunnel when no exit node
+  is used. Documented, not exercised. Cleartext upstream resolvers are
+  blocked by rule; that rule was exercised with an injected packet, not with
+  a tailnet configured that way.
+- Fragmentation of datagrams larger than the tunnel MTU without DF, and
+  ICMP-based tools: workloads have no raw sockets; path-MTU discovery was
+  verified with UDP and a bulk TCP transfer only.
+- Natural key expiry (waiting out a key's lifetime); expiry was forced from
+  the control server.
+- Long-running behaviour: daemon restarts by itself are not supervised, a
+  dead daemon stays dead until stop/start (fail closed); DERP map or control
+  address changes over days were not observed.
+- sudo.ws, older tailscale releases and control servers other than headscale
+  0.29.7 were not run. A host that itself uses an exit node was not tested.
+- The verbatim text of the host's `tailscale status` was not byte-identical
+  across runs: its activity column (traffic counters of the user's own live
+  peers) changes independently. The identity, preference, routing, firewall
+  and resolver snapshots were identical.
+
 ## 2026-11-11: directory activation (feature 2, version 0.3.0)
 
 Same host as below. **30 acceptance groups passed, 0 failed** (14 original,
@@ -186,6 +299,8 @@ No failed checks remain in the final suite. During development:
 - Public-internet VPN transport, distinct public VPN egress IP, external VPN
   provider interoperability, and practical WAN MTU/fragmentation: only local
   servers were supplied/created. Direct HTTPS is not proof of those VPN claims.
+  (2026-11-11: executed for the Tailscale backend against a remote VM, see the
+  feature 3 section; still not established for WireGuard and OpenVPN.)
 - OpenVPN TCP transport and every optional import directive were not separately
   integration-tested; the executed backend test uses TLS over UDP with copied
   CA/certificate/key files. Referenced auth-file copying/restrictive permissions

@@ -2,16 +2,18 @@
 
 Persistent Linux development sessions with **your host's tools**, private
 credentials/home/processes, explicitly shared projects, and isolated off,
-direct, WireGuard or OpenVPN networking. No container image or per-session
+direct, WireGuard, OpenVPN or Tailscale networking. No container image or per-session
 tool installation.
 
 ## Install
 
 Tested on Ubuntu 26.04, Linux 7.0, Python 3.14, Bubblewrap 0.11.1,
-util-linux 2.41+, nftables, WireGuard tools and OpenVPN 2.7.
+util-linux 2.41+, nftables, WireGuard tools, OpenVPN 2.7 and Tailscale 1.104
+(against headscale 0.29).
 
 ```sh
 sudo apt-get install bubblewrap iproute2 nftables util-linux wireguard-tools openvpn
+# optional, for the Tailscale backend: the tailscale package (tailscale, tailscaled)
 ./install.sh
 devsession doctor
 ```
@@ -164,7 +166,8 @@ devsession start client-b
 devsession exec client-a -- curl http://private.example
 ```
 
-Both backends require **IPv4 full tunnel**, with IPv6 explicitly blocked.
+WireGuard and OpenVPN require **IPv4 full tunnel**, with IPv6 explicitly blocked
+(Tailscale is described below).
 DNS goes through the tunnel. Each gateway has its own routes/interfaces;
 overlapping private VPN ranges work across sessions. The forwarding kill
 switch exists before workloads and remains during failure/reconnect. Only
@@ -189,6 +192,59 @@ Supported configuration policy:
   10.203.0.0/30 is reserved for the inner link and cannot be a VPN service range.
 
 Examples: [WireGuard](examples/wireguard.conf), [OpenVPN](examples/client.ovpn).
+
+### Tailscale
+
+A session can join a tailnet as **its own node**, through its own `tailscaled`
+in its gateway namespace. This is independent of any Tailscale on the host:
+the host's daemon, login and tailnet are never contacted or changed.
+
+```sh
+devsession stop client-c
+devsession vpn configure client-c --tailscale --auth-key-file ./authkey   # or --auth-key-stdin
+devsession net set client-c vpn
+devsession start client-c
+devsession exec client-c -- curl http://build-box.tailnet-name.ts.net
+```
+
+| Option | Meaning |
+|---|---|
+| `--auth-key-file FILE`, `--auth-key-stdin` | Auth key for unattended login. Stored root-only (0600), passed to the client as a file, never on a command line, never shown by `inspect`. A reusable key lets the session log in again after logout or key expiry |
+| `--login-server URL` | Self-hosted control server (headscale). A host name is resolved once at configuration, like other endpoints; reconfigure to refresh |
+| `--ca-file FILE` | Extra PEM CA certificates for a self-hosted control or relay server |
+| `--exit-node PEER` | Send all IPv4 through this peer |
+| `--accept-routes` | Accept subnet routes advertised in the tailnet |
+| `--dns IPv4` | Explicit resolver(s) reached through the tunnel instead of MagicDNS |
+| `--hostname NAME` | Node name (default `ds-SESSION`) |
+| `--transport-net CIDR` | A private range the gateway daemon (never a workload) may reach, for a control or relay server on a private address |
+
+What workloads can reach:
+
+- **Without an exit node**: tailnet addresses and, with `--accept-routes`,
+  advertised subnets. Everything else is dropped at the gateway and counted;
+  it is never sent directly. This backend is deliberately not a full tunnel
+  unless you select an exit node.
+- **With an exit node**: all IPv4 goes through it. If the exit node, the
+  daemon, the login or the node key is lost, traffic stops; nothing falls
+  back to a direct path. Start fails if the exit node is not in the tailnet.
+- **DNS**: MagicDNS at 100.100.100.100, answered by the session's own daemon:
+  tailnet names, split-DNS domains through the tunnel, and with an exit node
+  everything through the exit node. Names with no route through the tunnel
+  fail. With `--dns`, those resolvers are used through the tunnel instead.
+  The daemon itself has no system resolver and cleartext DNS from it is
+  refused at the gateway. Residual: a tailnet that configures a DNS-over-HTTPS
+  upstream is contacted by the daemon over HTTPS outside the tunnel
+  (encrypted, but not through the tunnel) when no exit node is in use.
+- **IPv6** stays blocked, as for the other backends.
+- **Inbound from the tailnet is closed**: shields are up, and Tailscale SSH,
+  advertised routes or exit node, serve/funnel, the web client and the peer
+  relay cannot be configured and are verified off at every start. Workloads
+  cannot see the daemon's socket or state.
+
+Node state persists across stop/start (a one-time key is spent once).
+`delete` logs the node out of the tailnet first, best effort and bounded
+(`--no-logout` skips it, for example when offline). Requires the `tailscale`
+package on the host; `doctor` lists it.
 
 ## Scripting
 
@@ -398,4 +454,8 @@ hostile workloads.
 
 See [cleanup/uninstall](docs/CLEANUP.md) for significant system changes and
 their reversal. Same-VM tests exercise real tunnels but do not establish a
-distinct public VPN egress IP or public-internet VPN transport/MTU behavior.
+distinct public VPN egress IP or public-internet VPN transport/MTU behavior
+for WireGuard and OpenVPN. The Tailscale backend was additionally run once
+over the public internet against a remote control server and exit node; see
+[executed results](docs/RESULTS.md), which also list what is not established
+(notably Tailscale's hosted service).

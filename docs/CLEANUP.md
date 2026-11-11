@@ -92,5 +92,30 @@ rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/devsession"
 directory `/tmp/devsession-activation-*` that also holds its approval store;
 after an interrupted run delete those sessions and that directory.
 
+## Tailscale
+
+A session's node state (`STATE/tailscale`), auth key (`STATE/vpn/authkey`)
+and daemon are removed by `stop`/`delete` like any other session resource;
+`delete` first logs the node out of its tailnet. If that was skipped or
+failed, remove the node in the tailnet's admin interface (or let its key
+expire). Nothing is installed into the host's tailscaled, `/etc` or
+systemd-resolved, so there is nothing to restore there.
+
+The `tailscale` acceptance group uses sessions `ts-a ts-n ts-x ts-o ts-p ts-w
+ts-v`, namespaces `dslab-hs`/`dslab-ts`, host links `dslab20`/`dslab21` and
+files under `/tmp/opencode/devsession-lab`; `sudo python3 -B tests/lab.py
+down` removes the fixtures. The headscale binary under `/tmp/opencode/hs` and
+captures `/tmp/opencode/ts-*-transport.pcap` are kept as evidence and can be
+deleted. After an interrupted run:
+
+```sh
+for s in ts-a ts-n ts-x ts-o ts-p ts-w ts-v ts-vm; do devsession delete --if-exists --no-logout "$s"; done
+sudo python3 -B tests/lab.py down; devsession cleanup
+```
+
+The real-internet run leaves nothing on the test host beyond that. On the
+remote machine run `tests/remote_vm_cleanup.sh PUBLIC_IP` as root, then close
+the firewall rules and release any address opened for it.
+
 The legacy session `prototype` (`/var/lib/devsession/prototype`) predates
 this work and is deliberately left in place as the state-migration check.

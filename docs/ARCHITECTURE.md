@@ -266,6 +266,112 @@ Feature 2 (0.3.0) binds a directory tree to a session through a marker file.
   about 85 microseconds per prompt six levels deep, and zero processes for
   2000 prompts.
 
+## Tailscale backend: decisions and reasons
+
+Feature 3 (0.4.0) adds `tailscale` next to WireGuard and OpenVPN.
+
+```
+workload ns   eth0 10.203.0.2 ──► gateway ns  lan 10.203.0.1
+                                   FORWARD: lan -> vpn0 only
+                                   vpn0 (TUN) ◄─► tailscaled  [private mount ns: own /etc, empty /run]
+                                   OUTPUT: wan tcp/udp (not port 53) = the daemon's transport
+                                   wan ──► host veth ──► NAT ──► control, DERP, STUN, peers
+```
+
+- **One daemon per session, nothing shared with the host's.** Socket
+  `STATE/tailscale/tailscaled.sock`, state `STATE/tailscale/var`, interface
+  `vpn0` in the gateway namespace, and a UDP port allocated per session from
+  41700 upward (the host's default is 41641). `STATE/tailscale` is root-only
+  (0700), so neither the invoking user nor a workload can reach the socket.
+- **Host DNS is protected structurally (`TS_BOX`).** A network namespace does
+  not hide `/etc/resolv.conf`, systemd-resolved, NetworkManager or the system
+  D-Bus from a root process, and tailscaled reconfigures host DNS through
+  them. Every tailscale binary devsession starts, the daemon and each CLI
+  call, therefore runs in a private mount namespace in which `/etc` is a
+  session-owned directory (resolver file, hosts, CA bundle), `/run` is an
+  empty tmpfs (no D-Bus socket, no resolved, no NetworkManager, and no socket
+  of the host's tailscaled), `/var/lib/tailscale` and `/var/cache/tailscale`
+  are empty tmpfs, and `/usr` is read-only. `--accept-dns` then makes the
+  daemon rewrite only its own private `resolv.conf`. This is why a missing
+  `--socket` could not reach the host daemon either. Preferences
+  (`--netfilter-mode=off`, no auto-update) are a second layer, not the
+  protection.
+- **The transport rule.** Tailscale has no single endpoint: control plane,
+  DERP relays, STUN and direct peer UDP on arbitrary ports. The "one exact
+  endpoint" exception is replaced for this backend by: *the gateway namespace
+  contains exactly one process, the session's tailscaled, so locally
+  originated packets (OUTPUT) are that daemon's transport; workload packets
+  are only ever FORWARD and may only enter `vpn0`.* OUTPUT on `wan` accepts
+  TCP and UDP except destination port 53, which is dropped and counted (the
+  daemon must not emit cleartext DNS; it has no resolver configured, and the
+  control host is a hosts-file entry resolved at configuration time). The
+  host end of the session link and multicast are refused as well: tailscaled
+  probes its default gateway for NAT-PMP, PCP and UPnP port mappings, and the
+  daemon has no business addressing the host (port mapping is also switched
+  off by environment). INPUT stays established-only; behind the host's NAT
+  nothing unsolicited arrives.
+- **What the gateway may reach.** Any public IPv4 destination, through the
+  host's NAT. The host-side rule that blocks private, link-local, CGNAT
+  (100.64.0.0/10) and connected ranges applies to the daemon exactly as to a
+  direct session, with two consequences: it can never route into the *host's*
+  tailnet, whose addresses are in 100.64.0.0/10 and whose routes sit in the
+  host's table 52; and peers or relays on the local network are reached only
+  through public or relayed paths. `--transport-net CIDR` is the explicit
+  exception for a self-hosted control or relay server on a private address.
+  Workloads gain nothing from it: their packets never reach `wan`.
+- **Not a full tunnel, by policy.** tailscaled installs policy rules and
+  table 52 in the gateway namespace. A destination without a route there
+  falls through to the main table's default via `wan`, and is dropped by the
+  forward chain (`lan -> vpn0` only). So "no exit node" means tailnet and
+  accepted routes only, and "exit node lost" means nothing, never direct.
+- **tailscaled cannot loosen the guard.** `--netfilter-mode=off` keeps it from
+  creating chains at all (verified: only `inet guard` and `ip nat` exist).
+  Even if it did, an accept in another base chain cannot undo a drop in ours.
+  Its routes only select among interfaces the forward chain already limits.
+  Daemon killed: `vpn0` and its routes vanish, the policy stays. Logged out or
+  key expired: the TUN stays, tailscaled forwards nothing.
+- **`--exit-node-allow-lan-access=true` is required, and safe here.** With an
+  exit node and LAN access disallowed, tailscaled routes every connected
+  subnet into the tunnel; in this namespace those are the gateway's own
+  `lan`/`wan` links, so replies could not return to the workload. Allowing
+  it restores normal routing for those two links only; workload access to
+  them remains refused by the forward chain.
+- **The exit node is selected after login, before any workload exists.** A
+  peer cannot be named before the first netmap. Until it is selected only
+  tailnet addresses are routable and no workload has been admitted, so there
+  is no window of direct or partial access.
+- **Exposure is impossible to request and verified anyway.** The importer has
+  no option for SSH, advertised routes or exit node, serve/funnel, operator,
+  shields-down or netfilter mode. Every start runs `up --reset` with the
+  complete preference set (`--shields-up`, `--ssh=false`, no advertisements),
+  resets serve/funnel, disables the web client, relay port and auto-update,
+  then reads the preferences back and refuses to start on any deviation.
+  Shields-up matters because tailscaled answers SSH, PeerAPI and serve in
+  userspace, before the kernel firewall sees anything. Workload access to the
+  service address 100.100.100.100 is limited to port 53.
+- **DNS.** MagicDNS means the workload's resolver is 100.100.100.100, reached
+  by forwarding into `vpn0`. The daemon's own "system resolver" is its
+  namespace's loopback, where nothing listens: tailscaled insists on a base
+  resolver before applying split-DNS routes, and this one makes unrouted names
+  fail instead of leaving. With an exit node tailscaled sends all queries to
+  the exit node's resolver through the tunnel.
+- **Unattended login.** The key is read from a file or stdin into
+  `STATE/vpn/authkey` (0600) and handed to the client as
+  `--auth-key=file:PATH`; `up --timeout` turns a missing or bad key into a
+  failed start instead of a login URL. Reconfiguring to a different login
+  server discards the node identity; otherwise it is kept.
+- **Logout on delete is best effort and bounded.** A running session logs out
+  directly. A stopped one brings up its gateway and daemon for at most about
+  half a minute. Failure is reported, never fatal; `--no-logout` skips it.
+- **Left out.** Tailscale's IPv6 addresses (IPv6 stays disabled in every
+  namespace), Taildrop, Tailscale SSH, serve/funnel, acting as subnet router,
+  exit node or relay, interactive (browser) login, and OAuth client or
+  workload-identity login. Each would either expose the gateway or need a
+  human.
+- **A host that itself uses an exit node** routes every session's transport
+  through it (host table 52), for all backends. That is the host's routing,
+  unchanged by devsession; it was not the case on the test host.
+
 ## Limits
 
 This is not a VM-equivalent hostile-workload boundary. The kernel is shared;
