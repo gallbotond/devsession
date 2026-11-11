@@ -29,6 +29,7 @@ a host Unix socket and a host tmux session named `ds-host-sentinel`.
 python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 sudo python3 -B tests/prototype.py
 python3 -B tests/acceptance.py | tee tests/acceptance.log
+python3 -B tests/acceptance.py scripting      # one group only: core, scripting
 ```
 
 `prototype.py` is the initial architecture gate, retained as an executable
@@ -45,6 +46,37 @@ commands only for test servers/fault injection/packet evidence. It writes
 synthetic Azure selected-account state from actual Azure authentication.
 The tests use real commands and real kernel networking; parser unit tests are
 additional checks, not replacements for networking tests.
+
+## Scripting checks (group `scripting`, `tests/accept_scripting.py`)
+
+Every call runs under `setsid` (no controlling terminal) with stdin closed or
+`/dev/null` unless the check itself feeds data. Sessions `scr-a`/`scr-b` use
+network mode off, so this group needs no lab servers.
+
+- S1: each documented failure status (1, 3, 120-127, 128+N) with its JSON
+  error object; a state lock held from outside gives 124 at once, 124 after
+  `--wait 1`, success with a sufficient `--wait`, and no delay for queries.
+- S2: a throwaway user `dvs-pwtest` with a random password and a
+  password-required rule in `/etc/sudoers.d/dvs-pwtest`. Without a terminal
+  devsession must exit 123 within 5 s; on a real PTY `--non-interactive` and
+  `DEVSESSION_NONINTERACTIVE=1` must refuse without prompting, and the plain
+  call must show sudo's password prompt. A root systemd service then runs
+  `devsession --user USER exec`. The user, its home and the sudoers file are
+  removed and their absence asserted.
+- S3: 64 MiB of random data host to session, session to host and round trip,
+  compared by SHA-256; all 256 byte values; closed stdin; SIGPIPE on an early
+  reader.
+- S4: 16 exit statuses (including 120-125) attributed to the command by
+  `--status-file`; HUP/INT/QUIT/USR1/TERM forwarded to a handler; death by
+  SIGTERM reported as 143 with `signal: 15`; no leftover process.
+- S5: 16 concurrent execs racing one auto-start; 8 concurrent
+  `create --ensure`; 16 mixed lifecycle calls with `--wait`.
+- S6: `changed` flags of the idempotent forms; stdout carries only command
+  output; `--cwd`/`--env`/`--env-file`/`--forward` precedence; an `--env-file`
+  secret absent from the host process listing; `-t`/`-T`.
+- S7: `examples/scripting.sh` and `examples/scripting.py` run to completion.
+- S8: the legacy `prototype` session is listed, inspected and reported
+  stopped, and its files are byte-identical afterwards.
 
 ## Topology
 

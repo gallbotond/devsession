@@ -31,8 +31,9 @@ routes; no supplied hooks run.
 
 ## Root boundary
 
-Creation/network setup/join/cleanup use sudo. This release requires an ordinary
-sudo-authorized host user; **do not delegate it as a restricted sudo command**.
+Creation/network setup/join/cleanup use sudo (or are started by root itself
+with `--user`). This release requires an ordinary sudo-authorized host user;
+**do not delegate it as a restricted sudo command**.
 It is an administration tool, not a multi-tenant privileged service or a
 setuid executable. The installed source is root-owned. Do not execute a
 user-writable development checkout with sudo on a non-disposable host.
@@ -119,6 +120,81 @@ access and host-only paths before import. Session-local .bashrc files are
 private and may be edited normally. Unexported running-shell state cannot be
 magically inherited. Other shells can be executed, but only Bash startup
 integration is supplied.
+
+## Scripting contract: decisions and reasons
+
+Feature 1 (0.2.0) made the CLI drivable without a human. The choices the
+requirements left open, with the reason for each:
+
+- **Reserved statuses 120-125, command status passed through.** A workload may
+  return any status, so no numbering is unambiguous on its own. The band was
+  chosen where real commands rarely exit (above sysexits' 64-78, below the
+  shell's 126/127/128+N), contiguous so a script tests one range, and 124
+  matches `timeout(1)`'s meaning for a bounded wait. Usage errors moved from
+  argparse's 2 to 121 because 2 is a common command status (grep, diff, bash).
+- **`--status-file` for exact attribution.** It is a file, not a descriptor,
+  because sudo closes descriptors above 2. The root side never opens a
+  caller-supplied path as root: a forked child takes the invoking user's UID,
+  GID and groups first, then opens it with `O_NOFOLLOW`. The unprivileged
+  front end empties the file before anything else, so a stale record cannot be
+  read as this call's result.
+- **126/127 are reported by devsession, not guessed.** The in-session
+  supervisor learns of a failed `execve` through a close-on-exec pipe from its
+  child, the standard technique, so "command not found" is distinguishable from
+  a command that exits 127.
+- **Supervisor reports are untrusted integers.** The supervisor runs as the
+  invoking UID inside the session and reports on a pipe that the command never
+  inherits (close-on-exec, and closed in the child). The root side reads at
+  most 4096 bytes and interprets only small integers; text shown to the user is
+  formatted by the root side. A hostile same-UID workload could forge its own
+  outcome (it controls its exit status anyway) but gains nothing else.
+- **`sudo -n` probe instead of a setuid helper or sudoers delegation.** When no
+  prompt is possible the front end runs `sudo -n true` first; a failure becomes
+  status 123 in milliseconds. A probe (rather than inspecting sudo's own exit
+  status) is needed because sudo's failure status 1 is also a valid command
+  status. The remaining race, a credential expiring between the probe and the
+  real call, surfaces as sudo's own message and status 1. "No prompt is
+  possible" means no controlling terminal can be opened, or the caller said so;
+  interactive use is unchanged, including `devsession ... < file` at a terminal.
+- **`--user` only for root itself.** A root service or root crontab is the one
+  unattended caller that has privilege without sudo. Root can already act as
+  any user, so naming the session owner grants nothing; through sudo the owner
+  is always `SUDO_UID` and `--user` is refused so that an ordinary user cannot
+  redirect an operation at another user's sessions by flag.
+- **Bounded lock wait, default unchanged.** Changes still fail at once when the
+  lock is held (now 124); `--wait` opts into polling with a deadline. flock has
+  no timeout, so the wait is a 50 ms non-blocking retry loop.
+- **Queries take no lock.** `list`, `status`, `exists` and `inspect` read state
+  that is only ever replaced by an atomic rename, so they need no lock and can
+  no longer hang behind a 30-second VPN start. A session deleted mid-listing is
+  skipped.
+- **`create --ensure` compares, never converges.** It checks only options given
+  explicitly and never modifies an existing session: silently remounting or
+  changing network mode from a script would be an implicit grant. A difference
+  is status 125 naming the differing options.
+- **Per-call environment travels like `--forward`.** `--env`/`--env-file`
+  values are validated as literal data by the front end, cross sudo inside the
+  one preserved variable `DEVSESSION_CONTEXT` (process environments are
+  readable only by the same user and root, unlike argv), and are applied after
+  the privilege drop. Isolation-reserved names are refused.
+- **Working directory is set by the supervisor.** The privileged join enters at
+  the session root; the unprivileged supervisor then changes directory, so a
+  missing `--cwd` is a reported error (120) rather than an nsenter failure, and
+  no directory handle from the host is held across the join.
+- **Signal dispositions are reset for the command.** Python ignores SIGPIPE and
+  SIGXFSZ and `execve` preserves ignored signals; before 0.2.0 workloads
+  inherited that and a pipeline writer never died when its reader left.
+- **Closed stdio is occupied.** If the caller closed descriptors 0-2, both
+  stages open `/dev/null` there first; otherwise an internal descriptor (lock,
+  status pipe, environment memfd) could have become the command's stdin.
+- **Older state loads read-only.** State written before UID-prefixed
+  directories (`/var/lib/devsession/NAME`) resolves when its recorded owner and
+  name match, with missing keys defaulted in memory. Nothing is rewritten until
+  an operation that changes that session.
+- **`doctor` exits 1 when a required prerequisite is missing** (it always
+  exited 0), so a provisioning script can gate on it.
+- **The Python client is a CLI client.** `examples/devsession_client.py` only
+  runs `devsession` and reads its documented status, JSON and status file.
 
 ## Limits
 

@@ -190,6 +190,101 @@ Supported configuration policy:
 
 Examples: [WireGuard](examples/wireguard.conf), [OpenVPN](examples/client.ovpn).
 
+## Scripting
+
+Every operation works unattended: no terminal, stdin closed, from Bash, cron,
+CI or Python. Working examples, executed by the acceptance suite:
+[`examples/scripting.sh`](examples/scripting.sh),
+[`examples/scripting.py`](examples/scripting.py) and the thin client module
+[`examples/devsession_client.py`](examples/devsession_client.py) (a client of
+this command line, not a second implementation).
+
+**Exit status.** `exec` and `shell` return the command's own status. devsession
+reserves 120-125 for itself, so a command exiting 1 or 2 is never mistaken for
+a tool failure (`devsession version --json` prints this table):
+
+| Status | Meaning |
+|---|---|
+| 0 | Success; for `exec`/`shell` the command exited 0 |
+| 1 | `exists`: no such session. `doctor`: a required prerequisite is missing |
+| 3 | `status`: the session exists but is stopped |
+| 120 | devsession failed: operation error, bad working directory, interrupted join |
+| 121 | Usage error (was argparse's 2) |
+| 122 | No such session |
+| 123 | Root privilege unavailable without a prompt |
+| 124 | State lock still busy after `--wait` |
+| 125 | Conflict with existing state: already exists, running, differs, `--no-start` |
+| 126, 127 | `exec`: command not executable / not found |
+| 128+N | `exec`/`shell`: the command was killed by signal N |
+| other | `exec`/`shell`: the command's own status |
+
+A command can itself exit 120-125. When that matters, `exec --status-file FILE`
+writes one JSON record: `{"source": "command"|"devsession", "exit_code": N,
+"signal": N|null, "error": KIND|null}`. `source` is `command` only if the
+command ran and this is its status. The file is emptied first; if it is still
+empty afterwards, devsession never reached the command. Until 0.2.0 every
+devsession failure and every usage error exited 2.
+
+**Output.** stdout carries only the command's output or the requested data;
+diagnostics go to stderr. `--json` (before or after the subcommand) makes
+`list`, `status`, `exists`, `create`, `start`, `stop`, `delete`, `env`, `net`,
+`vpn`, `cleanup`, `doctor` and `version` print one JSON document, and turns any
+error into a single line on stderr:
+`{"error": {"kind": "no-such-session", "exit_code": 122, "message": "..."}}`.
+`inspect` always prints JSON. `-q` suppresses informational text.
+
+```sh
+devsession status build            # prints running|stopped|absent; exit 0, 3 or 122
+devsession exists build            # exit 0 or 1, no output
+devsession --json list             # {"sessions": [{"name", "state", "running", "mode", "phase"}]}
+```
+
+**Ensure-style operations.** `create --ensure` succeeds if the session already
+exists and agrees with every option given (it never modifies an existing
+session; a difference is status 125). `stop --if-exists` and
+`delete --if-exists` succeed when there is nothing to do. `start`, `stop`,
+`env unset` and `net set` to the current mode are repeatable. JSON results
+carry `"changed": true|false`.
+
+**Waiting.** Changes take a global state lock. By default a busy lock fails at
+once with 124; `--wait SECONDS` (or `DEVSESSION_WAIT`) bounds the wait, a
+negative value waits without limit. `exec`, `shell` and `credential` wait
+without limit unless told otherwise. `list`, `status`, `exists` and `inspect`
+never wait.
+
+**Per-call exec options.**
+
+```sh
+devsession exec --cwd /workspace/api build -- make test      # working directory inside the session
+devsession exec --env STAGE=ci --env-file ./ci.env build -- ./deploy
+devsession exec -T build -- tar -c . > backup.tar            # never a pseudo-terminal
+devsession exec -t build -- some-tui < keys.txt              # always a pseudo-terminal
+devsession exec --no-start build -- true                     # 125 instead of starting it
+```
+
+`--env` values are visible in host process listings, so secrets belong in
+`--env-file` (literal `NAME=value` lines, like `env import`). Without `-t`/`-T`
+a pseudo-terminal is used only when stdin and stdout are both terminals.
+Data through `exec` is binary-clean in both directions, and the command sees
+default signal dispositions (a closed reader ends it with SIGPIPE). SIGINT,
+SIGTERM, SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 sent to devsession are forwarded.
+
+**Privilege without a human.** Setup still needs root; that does not change.
+When no prompt is possible (no controlling terminal, `--non-interactive` or
+`DEVSESSION_NONINTERACTIVE=1`), devsession runs `sudo -n` and fails within
+milliseconds with status 123 instead of waiting for a password. An unattended
+caller therefore needs one of:
+
+- an account whose sudo needs no password (the usual CI-runner or disposable-VM
+  arrangement);
+- a sudo credential refreshed beforehand (`sudo -v`) and still cached;
+- to be started by root itself (a systemd unit, root's crontab) and name the
+  session owner: `devsession --user alice exec build -- make`. Workloads still
+  run as `alice` with no capabilities. `--user` is refused through sudo.
+
+There is still no setuid helper and no restricted sudo rule: a sudoers entry
+limited to `/usr/local/bin/devsession` is root-equivalent, not a restriction.
+
 ## Lifecycle, servers and cleanup
 
 ```sh
@@ -210,8 +305,8 @@ session processes and releases interfaces, namespaces, firewall tables and
 published listeners. Home/configuration persist through stop/start. Delete
 removes private state, not bind-mounted projects. Stale/interrupted starts
 are recovered by the next start/stop or `cleanup`. Conflicting lifecycle
-operations are rejected with a retry message; multiple running execs are
-supported. Exec returns the command's status.
+operations are rejected with status 124 unless `--wait SECONDS` is given;
+multiple running execs are supported. Exec returns the command's status.
 
 Private-state deletion is ordinary filesystem deletion, not guaranteed secure
 erasure of SSD/snapshot/backup copies. Host administrators can inspect state.

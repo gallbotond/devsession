@@ -1,5 +1,10 @@
 # Implementation progress
 
+Three follow-on features are tracked at the end of this file (scripting,
+directory activation, Tailscale). Resume at the first unticked item there.
+
+## Original build (done)
+
 - [x] Inventory host and verify root/network/mount/PID namespace capabilities.
 - [x] Research Bubblewrap, WireGuard namespace semantics and OpenVPN configuration controls.
 - [x] Gate: prototype host tools + reviewed shell customization, private credentials, real WireGuard/DNS and fail-closed packet checks.
@@ -41,3 +46,42 @@ mature mechanisms, but selecting them would still require building a host
 installation rootfs and a separate protected VPN transport policy. No claim
 is made that rootless Podman cannot run VPNs; this task chose the smaller
 host-filesystem-oriented Bubblewrap layer and a privileged network setup.
+
+## Follow-on features (2026-11-11 onward)
+
+Strict order: scripting support, then directory activation, then Tailscale.
+The governing prompt is `docs/AUTONOMOUS_SESSION_PROMPT.md` (untracked copy in
+the checkout). Design rationales go to `docs/ARCHITECTURE.md`.
+
+Baseline before any change (2026-11-11, commit 9268a42, this host): parser unit
+tests 4 passed; `tests/acceptance.py` 14 check groups passed, 0 failed; host
+left clean. Known pre-existing gap: the legacy `prototype` session
+(`/var/lib/devsession/prototype`, written by `tests/prototype.py` before state
+directories were UID-prefixed) is shown by `list` but `inspect prototype`
+answers "No session". It is the migration check: read-only commands must load
+it and must leave its files byte-identical.
+
+### Feature 1: scripting support (done 2026-11-11, version 0.2.0)
+
+- [x] Reserved exit codes 120-125 for devsession, command status passed through; `--status-file` attribution
+- [x] Non-interactive privilege: `sudo -n` probe, exit 123, `--non-interactive`, direct-root `--user`
+- [x] Bounded lock wait (`--wait`, exit 124); lock-free read-only queries
+- [x] `--json` for list/create/doctor/status/lifecycle results and errors; `status`/`exists` by exit code
+- [x] Idempotent forms: `create --ensure`, `stop|delete --if-exists`, no-op `net set`
+- [x] `exec --cwd/--env/--env-file/-t/-T/--no-start`; SIGPIPE reset; 126/127 for unrunnable commands
+- [x] Legacy state (`prototype`) loads in list/inspect/status and is never rewritten by read/recovery paths
+- [x] `examples/scripting.sh`, `examples/scripting.py`, `examples/devsession_client.py`
+- [x] Acceptance group `scripting` (S1-S8, `tests/accept_scripting.py`): 22 groups passed in total, 0 failed
+- [x] Docs (README, ARCHITECTURE, TESTING, CLEANUP, RESULTS), installed copy matches source, pushed
+
+Result: unit tests 9 passed; acceptance 22 groups passed, 0 failed; no
+leftovers (namespaces, nft tables, throwaway user, sudoers file). Not
+established: see "Not established (feature 1)" in `docs/RESULTS.md`.
+
+### Feature 2: directory activation
+
+- [ ] Not started
+
+### Feature 3: Tailscale
+
+- [ ] Not started

@@ -64,3 +64,18 @@ runtime. Downloads under `/tmp/opencode` can be removed individually after
 inspection. Keep the source repository and test reports if desired. No host
 shell startup files, SSH keys, host default routes or host DNS configuration
 were intentionally modified.
+
+## Scripting checks
+
+The `scripting` acceptance group creates and removes the sessions `scr-a`,
+`scr-b`, `script-sh` and `script-py`, a throwaway host user and one sudoers
+file. They are removed by the run itself; after an interrupted run:
+
+```sh
+for s in scr-a scr-b script-sh script-py; do devsession delete --if-exists "$s"; done
+sudo pkill -KILL -u dvs-pwtest; sudo userdel -r dvs-pwtest
+sudo rm -f /etc/sudoers.d/dvs-pwtest
+```
+
+The legacy session `prototype` (`/var/lib/devsession/prototype`) predates
+this work and is deliberately left in place as the state-migration check.
