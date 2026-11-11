@@ -3,6 +3,9 @@
 
 Uses task-owned dslab-* server namespaces and acc-* sessions. No cloud login.
 Artifacts/results are written to tests/results.json; packet evidence in /tmp/opencode.
+
+    python3 -B tests/acceptance.py              # every group
+    python3 -B tests/acceptance.py scripting    # only the named group(s)
 """
 import concurrent.futures
 import contextlib
@@ -21,6 +24,8 @@ import time
 import traceback
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import accept_scripting
 REPO = HERE.parent
 HOME = Path.home()
 LAB = Path('/tmp/opencode/devsession-lab')
@@ -236,9 +241,7 @@ def interactive():
             os.kill(pid, signal.SIGKILL); os.waitpid(pid, 0)
 
 
-def main():
-    assert os.getuid() != 0, 'Run as normal sudo-authorized host user'
-    root('true')
+def core():
     route_before = cmd(['ip', '-j', 'route', 'show', 'default']).stdout
     resolver_before = Path('/etc/resolv.conf').read_bytes()
     resolver_link = os.readlink('/etc/resolv.conf') if Path('/etc/resolv.conf').is_symlink() else ''
@@ -401,7 +404,7 @@ def main():
             p = sp.Popen(['devsession', 'start', 'acc-broken'], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
             gw = c['namespaces']['gateway']
             eventually(lambda: root('ip', '-n', gw, 'link', 'show', 'wan'))
-            assert cli('stop', 'acc-b', check=False).returncode != 0, 'Concurrent lifecycle lock was not rejected'
+            eq(cli('stop', 'acc-b', check=False).returncode, 124)  # busy: concurrent lifecycle change rejected
             # Kill the installed root startup helper, leaving real partial kernel resources.
             output = root('pgrep', '-f', '/usr/local/lib/devsession/devsession.py start acc-broken').stdout
             for pid in output.split():
@@ -438,6 +441,21 @@ def main():
         user_tool.unlink(missing_ok=True)
         cmd(['tmux', 'kill-session', '-t', 'ds-host-sentinel'], check=False)
         shutil.rmtree(work)
+
+
+GROUPS = {'core': core, 'scripting': lambda: accept_scripting.run(check)}
+
+
+def main():
+    assert os.getuid() != 0, 'Run as normal sudo-authorized host user'
+    root('true')
+    Path('/tmp/opencode').mkdir(exist_ok=True)
+    selected = sys.argv[1:] or list(GROUPS)
+    try:
+        for group in selected:
+            GROUPS[group]()
+    finally:
+        cli('cleanup', check=False)
         (HERE / 'results.json').write_text(json.dumps(RESULTS, indent=2) + '\n')
     return 1 if any(x['status'] == 'failed' for x in RESULTS) else 0
 
