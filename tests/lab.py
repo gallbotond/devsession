@@ -11,7 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import devsession as ds
 
 LAB = Path('/tmp/opencode/devsession-lab')
-NAMES = ['dslab-a', 'dslab-b', 'dslab-o', 'dslab-direct']
+NAMES = ['dslab-a', 'dslab-b', 'dslab-o', 'dslab-direct', 'dslab-hs', 'dslab-ts']
+# Test prerequisite (docs/TESTING.md): the headscale release binary, not part of the runtime.
+HEADSCALE = Path(os.environ.get('HEADSCALE', '/tmp/opencode/hs/headscale'))
+HS_URL = 'https://198.18.20.2:8443'
 
 
 def r(*args, ns=None, input=None, check=True):
@@ -30,7 +33,7 @@ def cleanup():
             with contextlib.suppress(ProcessLookupError):
                 os.kill(int(pid), 9)
         r('ip', 'netns', 'del', ns, check=False)
-    for i in [10, 11, 12, 13]:
+    for i in [10, 11, 12, 13, 20, 21]:
         r('ip', 'link', 'del', f'dslab{i}', check=False)
 
 
@@ -92,7 +95,7 @@ PersistentKeepalive = 1
             'raw': f'[Interface]\nPrivateKey = {client}\n[Peer]\nPublicKey = {pubserver}\nEndpoint = 198.18.{i}.2:51820\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 1\n'}
 
 
-def up(openvpn=False):
+def up(openvpn=False, tailscale=False):
     cleanup()
     LAB.mkdir(mode=0o700, parents=True, exist_ok=True)
     ds.write(LAB / 'http.py', HTTP)
@@ -101,6 +104,8 @@ def up(openvpn=False):
     spawn('dslab-direct', ['python3', '-I', str(LAB / 'http.py'), '198.18.12.2', 'direct'], 'direct')
     if openvpn:
         ovpn()
+    if tailscale:
+        info['tailnet'] = tailnet()
     ds.write(LAB / 'info.json', json.dumps(info))
     time.sleep(.3)
     return info
@@ -158,9 +163,171 @@ verb 3
 ''')
 
 
+def hs(*args):
+    """headscale CLI against the lab server's own socket; JSON output."""
+    return json.loads(r(HEADSCALE, '-c', LAB / 'hs' / 'config.yaml', '-o', 'json', *args) or 'null')
+
+
+PEER = dict(state=str(LAB / 'peer'), netns='dslab-ts', tag='labpeer',
+            vpn=dict(kind='tailscale', pin=None, port=41641))
+
+
+def tailnet():
+    """A private tailnet: headscale (control, embedded DERP relay and STUN, TLS
+    from a lab CA) in dslab-hs and an ordinary tailscaled peer in dslab-ts.
+    Every key and certificate is generated here; nothing touches the host's
+    tailscaled or any hosted service."""
+    import shutil
+    if not HEADSCALE.is_file():
+        raise RuntimeError(f'headscale binary not found at {HEADSCALE}; see docs/TESTING.md')
+    link('dslab-hs', 20)
+    link('dslab-ts', 21)
+    # The peer reaches control/relay over a lab-internal link, so the fixture
+    # does not depend on (or switch on) IPv4 forwarding in the host namespace.
+    r('ip', '-n', 'dslab-hs', 'link', 'add', 'peer', 'type', 'veth', 'peer', 'name', 'control', 'netns', 'dslab-ts')
+    r('ip', '-n', 'dslab-hs', 'addr', 'add', '198.18.22.1/30', 'dev', 'peer')
+    r('ip', '-n', 'dslab-ts', 'addr', 'add', '198.18.22.2/30', 'dev', 'control')
+    r('ip', '-n', 'dslab-hs', 'link', 'set', 'peer', 'up')
+    r('ip', '-n', 'dslab-ts', 'link', 'set', 'control', 'up')
+    r('ip', '-n', 'dslab-ts', 'route', 'add', '198.18.20.2/32', 'via', '198.18.22.1')
+    r('sysctl', '-qw', 'net.ipv6.conf.all.forwarding=1', ns='dslab-ts')
+    d = LAB / 'hs'
+    shutil.rmtree(d, ignore_errors=True); shutil.rmtree(LAB / 'peer', ignore_errors=True)
+    d.mkdir(mode=0o700)
+    ec = ['-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes']
+    r('openssl', 'req', '-x509', *ec, '-keyout', d / 'ca.key', '-out', d / 'ca.crt', '-days', '3',
+      '-subj', '/CN=devsession lab CA', '-addext', 'basicConstraints=critical,CA:TRUE')
+    r('openssl', 'req', *ec, '-keyout', d / 'server.key', '-out', d / 'server.csr', '-subj', '/CN=198.18.20.2')
+    ds.write(d / 'san.cnf', 'subjectAltName=IP:198.18.20.2\nextendedKeyUsage=serverAuth\n')
+    r('openssl', 'x509', '-req', '-in', d / 'server.csr', '-CA', d / 'ca.crt', '-CAkey', d / 'ca.key',
+      '-CAcreateserial', '-out', d / 'server.crt', '-days', '3', '-extfile', d / 'san.cnf')
+    ds.write(d / 'config.yaml', f"""server_url: {HS_URL}
+listen_addr: 198.18.20.2:8443
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+tls_cert_path: {d}/server.crt
+tls_key_path: {d}/server.key
+noise:
+  private_key_path: {d}/noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: lab
+    region_name: devsession lab
+    verify_clients: true
+    stun_listen_addr: 198.18.20.2:3478
+    private_key_path: {d}/derp_private.key
+    automatically_add_embedded_derp_region: true
+    ipv4: 198.18.20.2
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 24h
+disable_check_updates: true
+database:
+  type: sqlite
+  sqlite:
+    path: {d}/db.sqlite
+    write_ahead_log: true
+log:
+  level: info
+policy:
+  mode: file
+  path: ""
+dns:
+  magic_dns: true
+  base_domain: lab.devsession.test
+  override_local_dns: false
+  nameservers:
+    global: []
+    split:
+      vpn.test:
+        - 100.64.0.1
+  search_domains: []
+  extra_records: []
+unix_socket: {d}/headscale.sock
+unix_socket_permission: "0700"
+logtail:
+  enabled: false
+""")
+    server = spawn('dslab-hs', [str(HEADSCALE), 'serve', '-c', str(d / 'config.yaml')], 'headscale')
+    for _ in range(150):
+        if server.poll() is not None:
+            raise RuntimeError('headscale exited: ' + (LAB / 'headscale.log').read_text()[-2000:])
+        if (d / 'headscale.sock').exists() and b'https' in sp.run(
+                ['ip', 'netns', 'exec', 'dslab-hs', 'ss', '-ltn'], capture_output=True).stdout.replace(b':8443', b'https'):
+            break
+        time.sleep(.2)
+    else:
+        raise RuntimeError('headscale did not start: ' + (LAB / 'headscale.log').read_text()[-2000:])
+    hs('users', 'create', 'lab')
+    user = str(hs('users', 'list')[0]['id'])
+    ds.write(LAB / 'ts-ca.crt', (d / 'ca.crt').read_text(), 0o644)
+    ds.write(LAB / 'ts-authkey', authkey(reusable=True) + '\n')
+    # The peer: an ordinary node offering an exit node and one subnet route.
+    (LAB / 'peer' / 'vpn').mkdir(parents=True)
+    ds.write(LAB / 'peer' / 'vpn' / 'ca.pem', (d / 'ca.crt').read_text())
+    ds.ts_prepare(PEER)
+    r('ip', '-n', 'dslab-ts', 'link', 'add', 'svc0', 'type', 'dummy')
+    r('ip', '-n', 'dslab-ts', 'addr', 'add', '10.78.0.1/24', 'dev', 'svc0')
+    r('ip', '-n', 'dslab-ts', 'link', 'set', 'svc0', 'up')
+    peer_daemon()
+    ds.ts(PEER, 'up', f'--login-server={HS_URL}', f'--auth-key=file:{LAB}/ts-authkey', '--hostname=lab-peer',
+          '--advertise-exit-node', '--advertise-routes=10.78.0.0/24', '--accept-dns=false', '--timeout=40s', timeout=60)
+    node = next(n for n in hs('nodes', 'list') if n['given_name'] == 'lab-peer')
+    hs('nodes', 'approve-routes', '--identifier', str(node['id']), '--routes', '0.0.0.0/0,::/0,10.78.0.0/24')
+    address = ds.ts_status(PEER)['Self']['TailscaleIPs'][0]
+    if address != '100.64.0.1':
+        raise RuntimeError(f'lab peer got {address}; the split-DNS fixture expects 100.64.0.1')
+    spawn('dslab-ts', ['python3', '-I', str(LAB / 'http.py'), '0.0.0.0', 'tailnet'], 'tailnet-http')
+    spawn('dslab-ts', ['dnsmasq', '--no-daemon', '--no-resolv', '--no-hosts', '--bind-interfaces',
+                       f'--listen-address={address},127.0.0.1', f'--address=/vpn.test/{address}',
+                       '--user=root', '--pid-file='], 'tailnet-dns')
+    return dict(login_server=HS_URL, ca=str(LAB / 'ts-ca.crt'), authkey=str(LAB / 'ts-authkey'),
+                peer='lab-peer', peer_ip=address, user=user)
+
+
+def peer_daemon():
+    base, etc, var, sock = ds.ts_paths(PEER)
+    with open(LAB / 'peer-tailscaled.log', 'a') as log:
+        sp.Popen(ds.ts_box(PEER, [ds.ts_binary('tailscaled'), '--tun=ts0', '--port=41641', f'--socket={sock}',
+                                  f'--statedir={var}', f'--state={var}/tailscaled.state', '--no-logs-no-support']),
+                 stdin=sp.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                 env={'PATH': ds.SYSTEM_PATH, 'LANG': 'C.UTF-8'})
+    for _ in range(100):
+        if ds.ts_status(PEER).get('BackendState') not in (None, 'NoState'):
+            return
+        time.sleep(.1)
+    raise RuntimeError('lab peer tailscaled failed: ' + (LAB / 'peer-tailscaled.log').read_text()[-2000:])
+
+
+def authkey(reusable=False, ephemeral=False, expiration='2h'):
+    user = str(hs('users', 'list')[0]['id'])
+    extra = (['--reusable'] if reusable else []) + (['--ephemeral'] if ephemeral else [])
+    return hs('preauthkeys', 'create', '--user', user, '--expiration', expiration, *extra)['key']
+
+
 if __name__ == '__main__':
     if sys.argv[1:] == ['down']:
         cleanup()
+    elif sys.argv[1:2] == ['hs']:      # headscale CLI passthrough for tests: lab.py hs nodes list
+        print(json.dumps(hs(*sys.argv[2:])))
+    elif sys.argv[1:2] == ['authkey']:  # lab.py authkey [reusable] [ephemeral]
+        print(authkey('reusable' in sys.argv, 'ephemeral' in sys.argv))
+    elif sys.argv[1:2] == ['peer']:    # lab.py peer TAILSCALE-ARGS...: CLI of the lab peer
+        p = ds.ts(PEER, *sys.argv[2:], check=False, timeout=60)
+        sys.stdout.write(p.stdout); sys.stderr.write(p.stderr); sys.exit(p.returncode)
+    elif sys.argv[1:] == ['peer-daemon']:
+        peer_daemon()
+    elif sys.argv[1:2] == ['session']:  # lab.py session UID NAME TAILSCALE-ARGS...: a session daemon's CLI
+        c = ds.load(int(sys.argv[2]), sys.argv[3])
+        p = ds.ts(c, *sys.argv[4:], check=False, timeout=60)
+        sys.stdout.write(p.stdout); sys.stderr.write(p.stderr); sys.exit(p.returncode)
     else:
-        up(openvpn=True)
+        up(openvpn=True, tailscale='tailscale' in sys.argv)   # lab.py up [tailscale]
         print(LAB)

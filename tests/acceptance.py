@@ -5,7 +5,7 @@ Uses task-owned dslab-* server namespaces and acc-* sessions. No cloud login.
 Artifacts/results are written to tests/results.json; packet evidence in /tmp/opencode.
 
     python3 -B tests/acceptance.py              # every group
-    python3 -B tests/acceptance.py scripting    # only the named group(s): core, scripting, activation
+    python3 -B tests/acceptance.py scripting    # only the named group(s): core, scripting, activation, tailscale
 """
 import concurrent.futures
 import contextlib
@@ -27,6 +27,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import accept_activation
 import accept_scripting
+import accept_tailscale
 REPO = HERE.parent
 HOME = Path.home()
 LAB = Path('/tmp/opencode/devsession-lab')
@@ -445,7 +446,8 @@ def core():
 
 
 GROUPS = {'core': core, 'scripting': lambda: accept_scripting.run(check),
-          'activation': lambda: accept_activation.run(check)}
+          'activation': lambda: accept_activation.run(check),
+          'tailscale': lambda: accept_tailscale.run(check)}
 
 
 def main():
