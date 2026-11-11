@@ -81,6 +81,30 @@ Found by these runs and fixed before the final results:
   (a normal Tailscale candidate endpoint). The host's private-range rule
   drops them; a capture on the uplink confirmed none left the machine.
 
+### Hosted service (Tailscale's own control plane)
+
+Executed once on 2026-11-11 with `tests/hosted_tailscale.py`
+([`tests/hosted.log`](../tests/hosted.log)). No throwaway tailnet was
+available; the tailnet's owner instructed that the check run in the tailnet
+the host's own tailscaled belongs to (`TS_ALLOW_HOST_TAILNET=1`). The scope
+was kept to one test node with shields up and no exit node.
+
+| Check | Result |
+|---|---|
+| Unattended login to the hosted control plane | Session `ts-hosted` started with a reusable, ephemeral auth key given on stdin and no `--login-server`; the node reached Running with a tailnet address. The daemon had no system resolver, so it found the control plane through tailscaled's own bootstrap |
+| Hosted relay network | A home DERP region was assigned |
+| MagicDNS through the tunnel | The node's own MagicDNS name resolved to its tailnet address from the workload; an outside name failed |
+| Not a full tunnel; gateway not exposed | `curl http://1.1.1.1` failed; preferences read back: shields up, SSH off, nothing advertised |
+| Kill switch | Daemon killed: name resolution and egress failed, forward-drop counter positive; stop/start resumed with the persisted node, no second login |
+| Host unchanged | While the session ran and after deletion, the host snapshots were identical except that the host, as a member of the same tailnet, saw the test node as an additional peer; that peer and its routes were left out of the comparison. The host daemon's PID, preferences, policy rules, nftables and resolver were byte-identical |
+| Logout on delete | `tailscale_logout: true`; the host then showed the node as expired and offline |
+
+Two earlier attempts the same day did not reach the assertions: the first
+was stopped by the script's same-tailnet guard before the owner's
+instruction (its node was logged out and remains listed as expired until
+removed in the admin console); the second failed at login because that
+single-use key was already spent.
+
 ### VM state after the run
 
 Removed and verified: `/tmp/dvs-ts` (binaries, CA, keys, database), headscale,
@@ -95,19 +119,11 @@ time while IAP access kept working.
 
 ### Not established (feature 3)
 
-- **Tailscale's hosted control plane.** `TS_AUTHKEY` for a throwaway tailnet
-  was not set, so interoperability with the hosted service, its DERP network
-  and its default DNS behaviour was not executed.
-  `tests/hosted_tailscale.py` is prepared for it. Two attempts on 2026-11-11
-  did not get as far as its assertions. The key supplied belonged to the
-  tailnet of the host's own tailscaled; the first attempt logged in (so
-  unattended login against the hosted control plane did work once), was
-  stopped by the script's same-tailnet guard, and the session was deleted
-  and its node logged out within the same run. The owner then allowed that
-  tailnet explicitly (`TS_ALLOW_HOST_TAILNET=1`), but the key was single-use
-  and already spent, so the second attempt failed at login and registered
-  nothing. No reachability, DNS, relay or fail-closed assertion has been
-  executed against the hosted service. The check remains unverified.
+- **Tailscale's hosted service beyond a single node.** See "Hosted service"
+  above for what was executed. Not executed there: an exit node, reaching
+  other peers, accepted subnet routes, data relayed through the hosted DERP
+  network, and tailnet-configured upstream resolvers. Other devices in that
+  tailnet were deliberately not contacted.
 - Relayed (DERP-only) transport on the real path: the real run connected
   directly. DERP was exercised only as far as each lab daemon's own home
   connection.

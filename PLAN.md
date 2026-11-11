@@ -91,7 +91,7 @@ established: see "Not established (feature 1)" in `docs/RESULTS.md`.
 
 Result: unit tests 13 passed; acceptance 30 groups passed, 0 failed.
 
-### Feature 3: Tailscale (done 2026-11-11, version 0.4.0; hosted-service check unverified)
+### Feature 3: Tailscale (done 2026-11-11, version 0.4.0)
 
 Design summary (details and reasons: `docs/ARCHITECTURE.md`, "Tailscale
 backend"): per-session `tailscaled` in the gateway namespace, launched inside
@@ -108,7 +108,7 @@ every start; exit node selected after login and before workloads.
 - [x] Hermetic lab in `tests/lab.py`: headscale 0.29.7 + DERP/STUN in `dslab-hs`, peer in `dslab-ts`
 - [x] Acceptance group `tailscale` (T1-T10, `tests/accept_tailscale.py`)
 - [x] Real-internet run on the remote VM (`tests/remote_tailscale.py`): R1-R7 passed; VM cleaned up and verified
-- [ ] Hosted Tailscale interoperability: needs `TS_AUTHKEY` for a throwaway tailnet; not set in this session, so unverified
+- [x] Hosted Tailscale interoperability: executed 2026-11-11 in the owner's own tailnet at their instruction (`TS_ALLOW_HOST_TAILNET=1`), single node, no exit node; see RESULTS "Hosted service"
 - [x] Full suite in one run: 40 groups passed, 0 failed; unit tests 16 passed; docs, installed copy matches source, pushed
 
 Remote VM bookkeeping: everything created for the run was removed and
@@ -117,7 +117,5 @@ verified on 2026-11-11 (firewall rules `dvs-ts-test-allow`, `dvs-ts-test-iap`,
 on `free-vm` nic0; `/tmp/dvs-ts` and a loopback address on the VM). Nothing is
 left running or installed there.
 
-All three features are done. Open item for a later session, needing a
-credential: run `TS_AUTHKEY=... python3 -B tests/hosted_tailscale.py` with a
-key for a throwaway tailnet and record the result in `docs/RESULTS.md`.
-Other gaps are listed under "Not established" there.
+All three features are done, including the hosted-service check. Remaining
+gaps are listed under "Not established" in `docs/RESULTS.md`.

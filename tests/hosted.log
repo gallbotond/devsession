@@ -1,0 +1,3 @@
+PASS hosted control plane: node ds-ts-hosted-1 Running with a tailnet address, a home relay region assigned; MagicDNS answers its own name through the tunnel; outside names and direct egress fail; shields up; host unchanged apart from seeing the test node as a peer while it ran; daemon killed: nothing reachable, forward drops counted
+node logged out on delete: True
+PASS host unchanged afterwards (the logged-out test node, as a peer of the host, left out)

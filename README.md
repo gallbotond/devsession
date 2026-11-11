@@ -457,5 +457,5 @@ their reversal. Same-VM tests exercise real tunnels but do not establish a
 distinct public VPN egress IP or public-internet VPN transport/MTU behavior
 for WireGuard and OpenVPN. The Tailscale backend was additionally run once
 over the public internet against a remote control server and exit node; see
-[executed results](docs/RESULTS.md), which also list what is not established
-(notably Tailscale's hosted service).
+[executed results](docs/RESULTS.md), which also list what is not established.
+A single-node check against Tailscale's hosted service is recorded there too.
