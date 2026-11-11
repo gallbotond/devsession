@@ -96,7 +96,7 @@ def host_tools(project, rc):
         inner = ex('acc-a', 'sh', '-c', 'command -v "$1"; readlink -f "$(command -v "$1")"', 'sh', name).stdout.splitlines()
         eq(inner, [path, str(Path(path).resolve())])
         a, b = cmd([name] + args).stdout, ex('acc-a', name, *args).stdout
-        if name == 'ansible':
+        if name in ('ansible', 'terraform'):  # terraform appends an online update notice
             eq(a.splitlines()[0], b.splitlines()[0])
         else:
             eq(a, b)

@@ -233,6 +233,8 @@ def network(c):
     # addresses are safe because every gateway/workload has its own network NS.
     a, b = c['transport']
     run(['ip', 'link', 'add', hostif, 'type', 'veth', 'peer', 'name', 'wan', 'netns', gateway])
+    # Host may have IPv6 on: keep its neighbor-discovery/MLD off the transport link.
+    run(['sysctl', '-qw', f'net.ipv6.conf.{hostif}.disable_ipv6=1'])
     run(['ip', 'addr', 'add', a + '/30', 'dev', hostif])
     run(['ip', '-n', gateway, 'addr', 'add', b + '/30', 'dev', 'wan'])
     run(['ip', '-n', gateway, 'link', 'add', 'lan', 'type', 'veth', 'peer', 'name', 'eth0', 'netns', client])

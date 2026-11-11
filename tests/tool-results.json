@@ -23,10 +23,10 @@
     ]
   },
   "oh-my-posh": {
-    "path": "/usr/local/bin/oh-my-posh",
-    "realpath": "/usr/local/bin/oh-my-posh",
+    "path": "/home/user/.local/bin/oh-my-posh",
+    "realpath": "/home/user/.local/bin/oh-my-posh",
     "version": [
-      "31.9.1"
+      "31.4.0"
     ]
   },
   "az": {
@@ -45,28 +45,28 @@
     ]
   },
   "ds-user-tool": {
-    "path": "/home/ubuntu/.local/bin/ds-user-tool",
-    "realpath": "/home/ubuntu/.local/bin/ds-user-tool",
+    "path": "/home/user/.local/bin/ds-user-tool",
+    "realpath": "/home/user/.local/bin/ds-user-tool",
     "version": [
       "user-local-ok"
     ]
   },
   "node": {
-    "path": "/home/ubuntu/.nvm/versions/node/v26.13.0/bin/node",
-    "realpath": "/home/ubuntu/.nvm/versions/node/v26.13.0/bin/node",
+    "path": "/home/user/.nvm/versions/node/v26.13.1/bin/node",
+    "realpath": "/home/user/.nvm/versions/node/v26.13.1/bin/node",
     "version": [
-      "v26.13.0"
+      "v26.13.1"
     ]
   },
   "npm": {
-    "path": "/home/ubuntu/.nvm/versions/node/v26.13.0/bin/npm",
-    "realpath": "/home/ubuntu/.nvm/versions/node/v26.13.0/lib/node_modules/npm/bin/npm-cli.js",
+    "path": "/home/user/.nvm/versions/node/v26.13.1/bin/npm",
+    "realpath": "/home/user/.nvm/versions/node/v26.13.1/lib/node_modules/npm/bin/npm-cli.js",
     "version": [
       "11.20.0"
     ]
   },
-  "/tmp/opencode/devsession-accept-1ui1kwvr/project/.venv/bin/python": {
-    "path": "/tmp/opencode/devsession-accept-1ui1kwvr/project/.venv/bin/python",
+  "/tmp/opencode/devsession-accept-9mhulmi1/project/.venv/bin/python": {
+    "path": "/tmp/opencode/devsession-accept-9mhulmi1/project/.venv/bin/python",
     "realpath": "/usr/bin/python3.14",
     "version": [
       "Python 3.14.4"

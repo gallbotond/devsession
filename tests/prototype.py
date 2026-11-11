@@ -17,8 +17,8 @@ def main():
     resolver = Path('/etc/resolv.conf').read_bytes()
     state = ds.ROOT / 'prototype'
     state.mkdir(mode=0o700, exist_ok=True)
-    c = dict(name='prototype', tag='prototype', uid=1000, gid=1000, user='ubuntu',
-             home='/home/ubuntu', shell='/bin/bash', path=ds.SYSTEM_PATH,
+    c = dict(name='prototype', tag='prototype', uid=1000, gid=1000, user='user',
+             home='/home/user', shell='/bin/bash', path=ds.SYSTEM_PATH,
              state=str(state), mode='vpn', transport=['10.231.255.1', '10.231.255.2'])
     ds.save(c)
     sentinel = sp.Popen(['sleep', '600'], env={'HOST_SENTINEL': 'NEVER_IN_SESSION'})
