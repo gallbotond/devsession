@@ -91,6 +91,51 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ds.Error):
                 ds.env_file(bad + '\n')
 
+    def test_marker_is_literal_data_naming_exactly_one_session(self):
+        self.assertEqual(ds.parse_marker(b'# comment\n\n  session = client-a  \n'), 'client-a')
+        for bad in [b'', b'session = $(id)', b'session = a; id', b'session = a\nsession = b', b'session = a\nmount = /etc:/x',
+                    b'session = A', b'session = ../x', b'session a', b'session = a\x1b[0m', b'session = a\x00', b'\xff\xfe',
+                    b'# ' + b'x' * 5000 + b'\nsession = a\n']:
+            with self.subTest(bad=bad[:30]), self.assertRaises(ds.Error):
+                ds.parse_marker(bad)
+
+    def test_directory_mapping_through_mounts(self):
+        c = dict(mounts=[dict(source='/home/u/proj', target='/workspace', ro=False),
+                         dict(source='/home/u/proj/vendor', target='/vendor', ro=True),
+                         dict(source='/srv/same', target='/srv/same', ro=False)])
+        self.assertEqual(ds.map_in(c, '/home/u/proj'), '/workspace')
+        self.assertEqual(ds.map_in(c, '/home/u/proj/a/b'), '/workspace/a/b')
+        self.assertEqual(ds.map_in(c, '/home/u/proj/vendor/x'), '/vendor/x')      # longest source wins
+        self.assertIsNone(ds.map_in(c, '/home/u/project'))                         # prefix of a name is not a parent
+        self.assertIsNone(ds.map_in(c, '/home/u'))
+        self.assertEqual(ds.map_out(c, '/workspace/a'), '/home/u/proj/a')
+        self.assertEqual(ds.map_out(c, '/tmp/x'), '/tmp/x')                        # unmounted: the same path
+        self.assertEqual(ds.tree_roots(c, '/home/u/proj'), ['/workspace', '/vendor'])
+        self.assertEqual(ds.tree_roots(c, '/home/u/proj/a'), ['/workspace/a'])
+        self.assertEqual(ds.tree_roots(c, '/elsewhere'), [])
+
+    def test_exec_without_a_session_name(self):
+        args = ds.parse(['exec', '--cwd', '/w', '--', 'make', '-j4', '--', 'x'])
+        self.assertEqual((args.name, args.cwd, args.command), (None, '/w', ['make', '-j4', '--', 'x']))
+        args = ds.parse(['--json', 'exec', 'name', '--', 'ls', '--json'])
+        self.assertEqual((args.name, args.json, args.command), ('name', True, ['ls', '--json']))
+        args = ds.parse(['exec', 'name', 'ls', '--', 'file'])
+        self.assertEqual((args.name, args.command), ('name', ['ls', '--', 'file']))
+        self.assertEqual(ds.parse(['status']).name, None)
+        self.assertEqual(ds.parse(['env', 'set', '.', 'K', 'v']).name, '.')
+        with self.assertRaises(ds.Error):
+            ds.parse(['delete'])                                                    # destructive: never implicit
+
+    def test_approval_store_cannot_be_mounted(self):
+        with tempfile.TemporaryDirectory() as t:
+            home = str(Path(t).resolve())
+            store = Path(home, '.local/state/devsession/allow'); store.mkdir(parents=True)
+            Path(home, 'proj').mkdir()
+            for source in [home + '/.local', home + '/.local/state', home + '/.local/state/devsession', str(store)]:
+                with self.subTest(source=source), self.assertRaises(ds.Error):
+                    ds.mount_spec(source + ':/x', home)
+            self.assertEqual(ds.mount_spec(home + '/proj:/x', home)['target'], '/x')
+
 
 if __name__ == '__main__':
     unittest.main()

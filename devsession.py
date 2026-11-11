@@ -23,15 +23,17 @@ SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 BLOCKED = '0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 192.0.0.0/24, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4'
 
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 # Exit statuses reserved for devsession itself. exec/shell pass the command's
 # own status through unchanged; 126/127/128+N keep their shell meaning.
 EXIT_ERROR, EXIT_USAGE, EXIT_NOSESSION, EXIT_PRIVILEGE, EXIT_BUSY, EXIT_CONFLICT = 120, 121, 122, 123, 124, 125
-KINDS = {EXIT_ERROR: 'error', EXIT_USAGE: 'usage', EXIT_NOSESSION: 'no-such-session',
+EXIT_UNAPPROVED = 119
+KINDS = {EXIT_UNAPPROVED: 'unapproved', EXIT_ERROR: 'error', EXIT_USAGE: 'usage', EXIT_NOSESSION: 'no-such-session',
          EXIT_PRIVILEGE: 'privilege', EXIT_BUSY: 'busy', EXIT_CONFLICT: 'conflict'}
 EXIT_CODES = {'0': 'success; exec/shell: the command exited 0',
-              '1': 'exists: no such session; doctor: a required prerequisite is missing',
+              '1': 'exists: no such session; resolve: no marker; doctor: a required prerequisite is missing',
               '3': 'status: the session exists but is stopped',
+              '119': 'the directory marker is not approved, or changed after approval',
               '120': 'devsession failed (operation error)',
               '121': 'usage error',
               '122': 'no such session',
@@ -42,7 +44,7 @@ EXIT_CODES = {'0': 'success; exec/shell: the command exited 0',
               '127': 'exec: command not found',
               '128+N': 'exec/shell: command killed by signal N',
               'other': 'exec/shell: the command\'s own exit status'}
-OUT = {'json': False, 'quiet': False, 'status_file': None, 'owner': None}
+OUT = {'json': False, 'quiet': False, 'status_file': None, 'hook_file': None, 'owner': None}
 
 
 class Error(Exception):
@@ -395,6 +397,7 @@ def filesystem(c):
     write(etc / 'hosts', '127.0.0.1 localhost\n', 0o644)
     write(etc / 'nsswitch.conf', 'passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n', 0o644)
     dns = c.get('vpn', {}).get('dns', []) if c['mode'] == 'vpn' else c.get('dns', ['1.1.1.1'])
+    write(etc / 'devsession-activate.bashrc', ACTIVATE_RC, 0o644)
     write(etc / 'resolv.conf', ''.join('nameserver ' + x + '\n' for x in dns) + 'options timeout:1 attempts:2\n', 0o644)
     args = ['bwrap', '--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--hostname', c['name'],
             '--new-session', '--cap-drop', 'ALL',
@@ -752,7 +755,8 @@ def stop(c):
 
 RESERVED_ENV = {'HOME', 'USER', 'LOGNAME', 'SHELL', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
                 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR', 'TMUX_TMPDIR', 'TMUX',
-                'AZURE_CONFIG_DIR', 'DEVSESSION'}
+                'AZURE_CONFIG_DIR', 'DEVSESSION', 'DEVSESSION_TREE', 'DEVSESSION_TREE_MARKER',
+                'DEVSESSION_LEAVE_FILE'}
 NAME_RE = re.compile(r'[a-z][a-z0-9-]{0,31}\Z')
 
 
@@ -843,7 +847,7 @@ def absolute(path):
     return str(Path(path))
 
 
-def mount_spec(spec, home):
+def mount_spec(spec, home, stores=()):
     parts = spec.split(':')
     if len(parts) not in [2, 3] or (len(parts) == 3 and parts[2] not in ['ro', 'rw']):
         raise Error('Mount syntax: /host/path:/session/path[:ro|rw] (colons in paths unsupported)')
@@ -854,6 +858,10 @@ def mount_spec(spec, home):
     forbidden_source = ['/', '/home', home, '/root', '/etc', '/run', '/proc', '/sys', '/dev', '/var', str(ROOT)]
     if str(source) in forbidden_source or str(source).startswith(('/proc/', '/sys/', '/dev/', '/run/', str(ROOT) + '/')):
         raise Error('Broad host/private/runtime mounts are forbidden; select a project or a specific credential file')
+    # A session that could write the approval records could approve any marker.
+    for store in [home + '/.local/state/devsession'] + [x for x in stores if x]:
+        if str(source) == store or store.startswith(str(source) + '/') or str(source).startswith(store + '/'):
+            raise Error('The directory-approval store (or a directory containing it) cannot be mounted into a session')
     protected = ['/', '/usr', '/bin', '/sbin', '/lib', '/lib64', '/etc', '/proc', '/sys', '/dev', '/run', '/tmp', '/var', '/home', home]
     if target in protected or any(target.startswith(x + '/') for x in ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/etc', '/proc', '/sys', '/dev', '/run', '/var']):
         raise Error('Mount target overlaps a protected system path')
@@ -924,7 +932,7 @@ def allocate():
 def build(args, user, context):
     """Validate create options into a session configuration (no state written)."""
     import secrets
-    mounts = [mount_spec(m, user.pw_dir) for m in args.mount]
+    mounts = [mount_spec(m, user.pw_dir, [context.get('state_home')]) for m in args.mount]
     targets = [m['target'] for m in mounts]
     if any(a == b or a.startswith(b + '/') or b.startswith(a + '/')
            for i, a in enumerate(targets) for b in targets[i + 1:]):
@@ -999,6 +1007,335 @@ def create(args, user, context):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Directory activation. A marker file binds a directory tree to a session by
+# name. It is untrusted repository content: parsed as data, effective only
+# after the user approved that exact path and content, with the approval kept
+# outside the tree. All of this runs as the invoking user; the privileged
+# side only ever receives a validated session name and directory strings.
+MARKER = '.devsession'
+
+
+def printable(text):
+    """Paths reach a terminal: never pass control characters on."""
+    return ''.join(ch if ch.isprintable() else '?' for ch in str(text))
+
+
+def state_home():
+    base = os.environ.get('XDG_STATE_HOME', '')
+    if not base.startswith('/'):
+        base = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.local', 'state')
+    return Path(base) / 'devsession'
+
+
+def parse_marker(data):
+    """Marker bytes -> session name. Declarative data; nothing is evaluated."""
+    if len(data) > 4096:
+        raise Error('Marker is larger than 4096 bytes')
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise Error('Marker is not UTF-8 text')
+    if any(not ch.isprintable() and ch not in '\n\t' for ch in text):
+        raise Error('Marker contains control characters')
+    found = {}
+    for number, line in enumerate(text.split('\n'), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.partition('=')
+        if not sep or key.strip() != 'session' or found:
+            raise Error(f'Marker line {number}: expected a single "session = NAME" (the only supported key)')
+        found['session'] = value.strip()
+    if not NAME_RE.fullmatch(found.get('session', '')):
+        raise Error('Marker must name one session: session = NAME, NAME matching [a-z][a-z0-9-]{0,31}')
+    return found['session']
+
+
+def resolve_marker(start):
+    """Nearest marker at or above start: dict(marker, dir, session, state, sha256, data) or None."""
+    import hashlib
+    import stat
+    here = Path(os.path.realpath(start))
+    for directory in [here, *here.parents]:
+        marker = directory / MARKER
+        if not os.path.lexists(marker):
+            continue
+        try:
+            fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            raise Error(f'{printable(marker)} must be a readable regular file, not a symbolic link')
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Error(f'{printable(marker)} must be a regular file')
+            data = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        session = parse_marker(data)
+        try:
+            recorded = approval_file(marker).read_bytes()
+        except OSError:
+            recorded = None
+        state = 'approved' if recorded == data else 'unapproved' if recorded is None else 'changed'
+        return dict(marker=str(marker), dir=str(directory), session=session, state=state,
+                    sha256=hashlib.sha256(data).hexdigest(), data=data)
+    return None
+
+
+def approval_file(marker):
+    """The approved copy lives outside the tree, at the marker's own absolute path."""
+    return state_home() / 'allow' / str(Path(marker).parent).lstrip('/') / MARKER
+
+
+def directory_session():
+    """Session for the current directory, or the reason there is none."""
+    if os.environ.get('DEVSESSION'):
+        raise Error(f'Already inside session {printable(os.environ["DEVSESSION"])}; a session is never entered from inside one',
+                    EXIT_CONFLICT)
+    found = resolve_marker(os.getcwd())
+    if found is None:
+        raise Error(f'No session name given and no {MARKER} marker in this directory or above it', EXIT_USAGE)
+    if found['state'] != 'approved':
+        raise Error(f'{printable(found["marker"])} ' + ('changed after it was approved' if found['state'] == 'changed'
+                    else 'is not approved') + '; review it, then run: devsession allow', EXIT_UNAPPROVED)
+    return found
+
+
+def activation(args):
+    """allow / deny / resolve / hook: the invoking user's own state, no privilege."""
+    os.umask(0o077)
+    if args.action == 'hook':
+        state_home().mkdir(mode=0o700, parents=True, exist_ok=True)
+        sys.stdout.write(HOOK_BASH.replace('@STATE@', shlex.quote(str(state_home()))))
+        return 0
+    found = resolve_marker(args.dir)
+    public = {k: v for k, v in (found or {}).items() if k != 'data'}
+    if args.action == 'resolve':
+        if found is None:
+            emit(dict(marker=None, session=None, state='none'))
+            return 1
+        emit(public, found['session'] if found['state'] == 'approved' else None)
+        if found['state'] != 'approved':
+            if not OUT['json']:
+                complain(EXIT_UNAPPROVED, f'{printable(found["marker"])} names session {found["session"]} but ' +
+                         ('changed after it was approved' if found['state'] == 'changed' else 'is not approved'))
+            return EXIT_UNAPPROVED
+        return 0
+    if found is None:
+        raise Error(f'No {MARKER} marker in {printable(os.path.realpath(args.dir))} or above it', EXIT_USAGE)
+    record = approval_file(found['marker'])
+    if args.action == 'deny':
+        changed = record.exists()
+        record.unlink(missing_ok=True)
+        for parent in record.parents:  # prune the now-empty mirror of the path
+            if parent == state_home() / 'allow':
+                break
+            with contextlib.suppress(OSError):
+                parent.rmdir()
+        emit(dict(public, action='deny', changed=changed, state='unapproved'), f'Revoked approval of {printable(found["marker"])}')
+        return 0
+    # allow: show precisely what is granted, taken from a normal inspect.
+    cmd = ['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--json'] + (
+        ['--non-interactive'] if args.non_interactive else [])
+    p = sp.run(cmd + ['inspect', found['session']], stdout=sp.PIPE, stderr=sp.PIPE, text=True)
+    if p.returncode == EXIT_NOSESSION:
+        raise Error(f'{printable(found["marker"])} names session {found["session"]}, which does not exist. '
+                    'Create it first: an approval always shows what the session holds', EXIT_NOSESSION)
+    if p.returncode:
+        try:
+            error = json.loads(p.stderr.splitlines()[-1])['error']
+            raise Error('Cannot show what would be granted: ' + error['message'], error['exit_code'])
+        except (ValueError, KeyError, IndexError):
+            raise Error('Cannot show what would be granted (inspect failed)')
+    c = json.loads(p.stdout)
+    network = c['mode'] + (f' ({c["vpn"]["kind"]})' if c['mode'] == 'vpn' and c.get('vpn') else '')
+    lines = [f'Marker:  {printable(found["marker"])}',
+             f'SHA-256: {found["sha256"]}',
+             f'Content: session = {found["session"]}',
+             f'Grants:  below {printable(found["dir"])}, a devsession command given no session name runs in',
+             f'         session "{found["session"]}", and an interactive Bash with the hook enters it on cd.',
+             '         Whatever is run there uses what that session holds:',
+             f'           network      {network}',
+             '           mounts       ' + (', '.join(f'{printable(m["source"])} -> {printable(m["target"])} ({"ro" if m["ro"] else "rw"})'
+                                                     for m in c['mounts']) or 'none'),
+             '           tool trees   ' + (', '.join(printable(t) for t in c['tools']) or 'none'),
+             '           environment  ' + (', '.join(sorted(c['env'])) or 'none') + ' (names; values are never shown)',
+             '           published    ' + (', '.join(f'127.0.0.1:{a} -> {b}' for a, b in c['publish']) or 'none'),
+             '           private home, credentials and caches of that session',
+             'Nothing more: a marker cannot add mounts, tools, network access, environment or commands.',
+             'Editing the marker revokes this approval; the record is kept outside the tree.']
+    if not OUT['json'] and not (OUT['quiet'] and args.yes):
+        print('\n'.join(lines), file=sys.stdout if args.yes else sys.stderr)
+    if not args.yes:
+        if not (sys.stdin and sys.stdin.isatty()):
+            raise Error('Approval needs a terminal to confirm, or --yes after reviewing the marker', EXIT_USAGE)
+        sys.stderr.write('Approve? [y/N] '); sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() not in ('y', 'yes'):
+            raise Error('Not approved', EXIT_UNAPPROVED)
+    record.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = record.with_name(MARKER + '.new')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    os.write(fd, found['data']); os.fsync(fd); os.close(fd)
+    os.replace(temporary, record)
+    emit(dict(public, action='allow', changed=found['state'] != 'approved', state='approved'),
+         f'Approved {printable(found["marker"])} for session {found["session"]}')
+    return 0
+
+
+def map_in(c, host):
+    """Host directory -> the path it has inside the session, or None if not mounted."""
+    best = None
+    for m in c['mounts']:
+        source = m['source'].rstrip('/')
+        if (host == source or host.startswith(source + '/')) and (best is None or len(source) > len(best[0])):
+            best = (source, m['target'].rstrip('/') + host[len(source):])
+    return best[1] if best else None
+
+
+def map_out(c, inner):
+    """Session directory -> host directory through the mounts; the same path otherwise."""
+    best = None
+    for m in c['mounts']:
+        target = m['target'].rstrip('/')
+        if (inner == target or inner.startswith(target + '/')) and (best is None or len(target) > len(best[0])):
+            best = (target, m['source'].rstrip('/') + inner[len(target):])
+    return best[1] if best else inner
+
+
+def tree_roots(c, tree):
+    """Session paths that lie inside the marked host tree."""
+    roots = []
+    for m in c['mounts']:
+        source, target = m['source'].rstrip('/'), m['target'].rstrip('/')
+        if source == tree or source.startswith(tree + '/'):
+            roots.append(target)
+        elif tree.startswith(source + '/'):
+            roots.append(target + tree[len(source):])
+    return roots
+
+
+def read_leave(path, uid):
+    """Directory a hook-entered shell left to. Written by the session: untrusted."""
+    import stat
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_size > 4096:
+            return None
+        text = os.read(fd, 4096).decode('utf-8', 'replace').split('\n')[0]
+    finally:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    try:
+        return absolute(text) if text.isprintable() else None
+    except Error:
+        return None
+
+
+# Host side, printed by `devsession hook bash`. Per prompt it runs shell
+# builtins only; see docs/ARCHITECTURE.md for the measured cost.
+HOOK_BASH = r'''# devsession directory activation for interactive Bash: eval "$(devsession hook bash)"
+# Each prompt runs shell builtins only. A process is started solely when a
+# component of the directory is a symbolic link (pwd -P) or a session is entered.
+# Switch automatic entry off with DEVSESSION_AUTO_ENTER=0.
+if [[ $- == *i* && -z ${DEVSESSION-} ]]; then
+_DEVSESSION_STATE=@STATE@
+_devsession_hook() {
+    local _ds_rc=$? _ds_dir _ds_part _ds_marker _ds_text _ds_ok _ds_target _ds_round=0
+    [[ ${DEVSESSION_AUTO_ENTER-1} == 0 || -n ${DEVSESSION-} ]] && return $_ds_rc
+    while :; do
+        _ds_dir=$PWD _ds_part=$PWD
+        while [[ -n $_ds_part && $_ds_part != / ]]; do
+            if [[ -L $_ds_part ]]; then _ds_dir=$(builtin pwd -P); break; fi
+            _ds_part=${_ds_part%/*}
+        done
+        _ds_marker= _ds_part=$_ds_dir
+        while :; do
+            if [[ -f ${_ds_part%/}/.devsession ]]; then _ds_marker=$_ds_part; break; fi
+            [[ -z $_ds_part || $_ds_part == / ]] && break
+            _ds_part=${_ds_part%/*}; [[ -z $_ds_part ]] && _ds_part=/
+        done
+        if [[ -z $_ds_marker ]]; then _DEVSESSION_SKIP= _DEVSESSION_NOTED=; return $_ds_rc; fi
+        [[ $_DEVSESSION_SKIP == "$_ds_marker" ]] && return $_ds_rc
+        _DEVSESSION_SKIP=
+        _ds_text= _ds_ok=
+        IFS= read -r -d '' _ds_text < "${_ds_marker%/}/.devsession"
+        if [[ -f $_DEVSESSION_STATE/allow${_ds_marker%/}/.devsession ]]; then
+            IFS= read -r -d '' _ds_ok < "$_DEVSESSION_STATE/allow${_ds_marker%/}/.devsession"
+            if [[ $_ds_text != "$_ds_ok" ]]; then
+                [[ $_DEVSESSION_NOTED == "$_ds_marker:$_ds_text" ]] ||
+                    printf 'devsession: %q changed after it was approved; review it, then run: devsession allow\n' "${_ds_marker%/}/.devsession" >&2
+                _DEVSESSION_NOTED=$_ds_marker:$_ds_text; return $_ds_rc
+            fi
+        else
+            [[ $_DEVSESSION_NOTED == "$_ds_marker:$_ds_text" ]] ||
+                printf 'devsession: %q is not approved; review it, then run: devsession allow\n' "${_ds_marker%/}/.devsession" >&2
+            _DEVSESSION_NOTED=$_ds_marker:$_ds_text; return $_ds_rc
+        fi
+        _DEVSESSION_NOTED=
+        [[ -t 0 && -t 1 ]] || return $_ds_rc
+        _ds_target=
+        command devsession shell --hook-file "$_DEVSESSION_STATE/leave.$$"
+        if [[ -f $_DEVSESSION_STATE/leave.$$ ]]; then
+            IFS= read -r _ds_target < "$_DEVSESSION_STATE/leave.$$"
+            command rm -f -- "$_DEVSESSION_STATE/leave.$$"
+        fi
+        # The session shell was left by changing directory out of the tree:
+        # follow to the same place on the host and look again from there.
+        if [[ -n $_ds_target && -d $_ds_target && $_ds_target != "$_ds_dir" && $((++_ds_round)) -le 8 ]] &&
+           builtin cd -- "$_ds_target" 2>/dev/null; then
+            continue
+        fi
+        [[ -n $_ds_target && ! -d $_ds_target ]] &&
+            printf 'devsession: left the session; %q does not exist on the host\n' "$_ds_target" >&2
+        # Plain exit (or a failed entry): stay on the host until this tree is left.
+        _DEVSESSION_SKIP=$_ds_marker
+        return $_ds_rc
+    done
+}
+if [[ ${PROMPT_COMMAND[*]-} != *_devsession_hook* ]]; then
+    if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then
+        PROMPT_COMMAND=(_devsession_hook "${PROMPT_COMMAND[@]}")
+    else
+        PROMPT_COMMAND="_devsession_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+    fi
+fi
+fi
+'''
+
+# Session side: the startup file of a hook-entered shell. It sources the
+# session's ordinary customization, then leaves the shell as soon as the
+# working directory is outside the marked tree or under a nearer marker.
+ACTIVATE_RC = r'''# Generated by devsession: session side of directory activation.
+[ -f /etc/devsession.bashrc ] && source /etc/devsession.bashrc
+if [[ -n ${DEVSESSION_TREE-} && -n ${DEVSESSION_LEAVE_FILE-} ]]; then
+_devsession_leave() {
+    local _ds_rc=$? _ds_root _ds_dir _ds_in=
+    while IFS= read -r _ds_root; do
+        [[ -z $_ds_root ]] && continue
+        if [[ $PWD == "$_ds_root" || $PWD == "${_ds_root%/}"/* ]]; then
+            _ds_in=1 _ds_dir=$PWD
+            while [[ -n $_ds_dir && $_ds_dir != "$_ds_root" ]]; do
+                if [[ -f $_ds_dir/.devsession ]]; then _ds_in=; break; fi
+                _ds_dir=${_ds_dir%/*}
+            done
+            [[ -n $_ds_in && $_ds_root != "${DEVSESSION_TREE_MARKER-}" && -f $_ds_root/.devsession ]] && _ds_in=
+            break
+        fi
+    done <<< "$DEVSESSION_TREE"
+    [[ -n $_ds_in ]] && return $_ds_rc
+    printf '%s\n' "$PWD" > "$DEVSESSION_LEAVE_FILE" 2>/dev/null
+    exit 0
+}
+PROMPT_COMMAND=(_devsession_leave "${PROMPT_COMMAND[@]}")
+fi
+'''
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         raise Error(f'{message} (try: {self.prog} --help)', EXIT_USAGE)
@@ -1022,7 +1359,32 @@ def common(top):
     return p
 
 
-def parser():
+def action_of(argv):
+    """The subcommand word of an argument vector (before argparse sees it)."""
+    skip = False
+    for word in argv:
+        if skip:
+            skip = False
+        elif word in ('--wait', '--user'):
+            skip = True
+        elif not word.startswith('-'):
+            return word
+    return None
+
+
+def parse(argv):
+    # `exec -- COMMAND` (no session name: the directory decides) cannot be
+    # expressed with argparse's REMAINDER, so the vector is split at the
+    # first `--` and only the part before it is parsed for exec.
+    if action_of(argv) == 'exec' and '--' in argv:
+        cut = argv.index('--')
+        args = parser(True).parse_args(argv[:cut])
+        args.command = args.command + (['--'] if args.command else []) + argv[cut + 1:]
+        return args
+    return parser().parse_args(argv)
+
+
+def parser(split=False):
     opts = common(False)
     p = Parser(prog='devsession', parents=[common(True)],
                description='Isolated Linux development sessions using host tools. Setup needs sudo; workloads never run as root.',
@@ -1043,12 +1405,16 @@ def parser():
     for op in ['start', 'stop', 'delete', 'inspect', 'shell', 'status', 'exists']:
         q = add(sub, op, help={'status': 'Exit 0 running, 3 stopped, 122 absent',
                                'exists': 'Exit 0 if the session exists, 1 if not'}.get(op))
-        q.add_argument('name')
+        if op in ['delete', 'exists']:
+            q.add_argument('name', help='Session name, or "." for the session this directory is bound to')
+        else:
+            q.add_argument('name', nargs='?', help='Session name; omitted or ".": the session this directory is bound to')
         if op in ['stop', 'delete']:
             q.add_argument('--if-exists', action='store_true', help='Succeed when there is no such session')
         if op == 'shell':
             q.add_argument('--forward', action='append', default=[], metavar='VARIABLE')
             q.add_argument('--cwd', metavar='DIR', help='Working directory inside the session')
+            q.add_argument('--hook-file', help=argparse.SUPPRESS)  # used by the shell hook only
     q = add(sub, 'exec', help='Run argv without shell interpolation, auto-starting if necessary')
     q.add_argument('--forward', action='append', default=[], metavar='VARIABLE')
     q.add_argument('--cwd', metavar='DIR', help='Working directory inside the session for this call')
@@ -1063,7 +1429,17 @@ def parser():
     q.add_argument('--no-start', action='store_true', help='Fail with status 125 instead of starting a stopped session')
     q.add_argument('--status-file', metavar='FILE',
                    help='Write a JSON record saying whether the exit status is the command\'s or devsession\'s')
-    q.add_argument('name'); q.add_argument('command', nargs=argparse.REMAINDER)
+    if split:
+        q.add_argument('name', nargs='?'); q.add_argument('command', nargs='*')
+    else:
+        q.add_argument('name', help='Session name; with "exec -- COMMAND" the directory decides')
+        q.add_argument('command', nargs=argparse.REMAINDER)
+    q = add(sub, 'allow', help='Approve the nearest .devsession marker after showing exactly what it grants')
+    q.add_argument('dir', nargs='?', default='.'); q.add_argument('-y', '--yes', action='store_true', help='Do not ask (the grant is still printed)')
+    q = add(sub, 'deny', help='Revoke the approval of the nearest .devsession marker'); q.add_argument('dir', nargs='?', default='.')
+    q = add(sub, 'resolve', help='Print the session a directory is bound to: exit 0 approved, 1 no marker, 119 not approved')
+    q.add_argument('dir', nargs='?', default='.')
+    q = add(sub, 'hook', help='Print shell integration; use: eval "$(devsession hook bash)"'); q.add_argument('shell', choices=['bash'])
     add(sub, 'list'); add(sub, 'doctor', help='Report prerequisites and host tool paths; exit 1 if a required one is missing')
     add(sub, 'version', help='Print the version (and the exit-status table with --json)')
     add(sub, 'cleanup', help='Clean stale owned resources; restore forwarding if all sessions stopped')
@@ -1158,11 +1534,14 @@ def lock_state(wait):
 
 
 def write_status(record):
-    """Attribution record for exec --status-file, written with the caller's own rights."""
-    path = OUT.get('status_file')
+    """Attribution record for exec --status-file."""
+    write_owner(OUT.get('status_file'), (json.dumps(record) + '\n').encode() if record else b'')
+
+
+def write_owner(path, data):
+    """Write a caller-named file with the caller's own rights, never as root."""
     if not path:
         return
-    data = (json.dumps(record) + '\n').encode() if record else b''
     def store():
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         os.write(fd, data); os.close(fd)
@@ -1207,11 +1586,16 @@ def main(argv=None):
         except OSError:
             os.set_inheritable(os.open(os.devnull, os.O_RDWR), True)
     OUT['json'] = '--json' in (argv[:argv.index('--')] if '--' in argv else argv)
-    args = parser().parse_args(argv)
+    args = parse(argv)
     OUT.update(json=args.json, quiet=args.quiet)
     if args.action == 'version':
         emit(dict(version=VERSION, exit_codes=EXIT_CODES), VERSION)
         return 0
+    if args.action in ['allow', 'deny', 'resolve', 'hook']:
+        if os.geteuid() == 0:
+            raise Error('Directory approvals belong to a user; run this as that user, not as root', EXIT_USAGE)
+        return activation(args)
+    by_dir = args.action != 'create' and hasattr(args, 'name') and args.name in (None, '.')
     direct_root = os.geteuid() == 0 and 'SUDO_UID' not in os.environ
     if args.user and not direct_root:
         raise Error('--user is only for invocations started by root itself, not through sudo', EXIT_USAGE)
@@ -1219,6 +1603,15 @@ def main(argv=None):
         context = invocation(args)
         OUT['status_file'] = context['status_file']
         write_status(None)  # a stale record must never be mistaken for this call's
+        context['state_home'] = str(state_home())
+        if getattr(args, 'hook_file', None):
+            context['hook_file'] = os.path.abspath(args.hook_file)
+            write_owner(context['hook_file'], b'')
+        if by_dir:
+            # The marker is read, parsed and checked against the approval here,
+            # as the user. Root receives the resulting name and two paths.
+            found = directory_session()
+            context.update(session=found['session'], tree=found['dir'], hostcwd=os.path.realpath(os.getcwd()))
         if args.action == 'doctor':
             return doctor(context)
         # No arbitrary host environment, agent socket or token is inherited by
@@ -1247,6 +1640,11 @@ def main(argv=None):
     except KeyError:
         raise Error(f'Unknown user: {args.user}', EXIT_USAGE)
     OUT.update(status_file=context.get('status_file'), owner=user if user.pw_uid else None)
+    if by_dir:
+        if not context.get('session'):
+            raise Error('A session name is required here: directory resolution needs the invoking '
+                        'user\'s own approval records', EXIT_USAGE)
+        args.name = context['session']
     if user.pw_uid == 0 and args.action not in ['doctor', 'cleanup', 'list']:
         raise Error('Invoke as a normal host user (or via sudo from that user, or as root with --user NAME); '
                     'root workloads are forbidden', EXIT_USAGE)
@@ -1368,8 +1766,27 @@ def main(argv=None):
             extra.update({env_key(k): v for k, v in context.get('forward', {}).items()})
             extra.update({env_key(k): v for k, v in context.get('env', {}).items()})
             cwd = absolute(args.cwd) if getattr(args, 'cwd', None) else None
+            leave = None
+            if by_dir and cwd is None and args.action != 'credential':
+                # Same place, as the session sees it: the host directory mapped through the mounts.
+                cwd = map_in(c, absolute(context['hostcwd']))
+                if cwd is None:
+                    raise Error(f'{printable(context["hostcwd"])} is not inside a mount of session {c["name"]}; '
+                                'mount the project there or pass --cwd')
             if args.action == 'shell':
                 command = ['/bin/bash', '--noprofile', '--rcfile', '/etc/devsession.bashrc', '-i']
+                if by_dir and context.get('hook_file'):
+                    if Path(f'/proc/{c["pid"]}/root/etc/devsession-activate.bashrc').exists():
+                        import secrets
+                        leave = 'devsession-leave-' + secrets.token_hex(8)
+                        tree = absolute(context['tree'])
+                        extra.update(DEVSESSION_TREE='\n'.join(tree_roots(c, tree)),
+                                     DEVSESSION_TREE_MARKER=map_in(c, tree) or '',
+                                     DEVSESSION_LEAVE_FILE=f'/run/user/{c["uid"]}/{leave}')
+                        command[3] = '/etc/devsession-activate.bashrc'
+                    else:
+                        print('devsession: this session was started by an older version; restart it '
+                              'to be returned to the host on leaving the tree', file=sys.stderr)
             elif args.action == 'credential':
                 dest = Path(args.destination)
                 if dest.is_absolute() or '..' in dest.parts or not dest.parts:
@@ -1390,6 +1807,10 @@ def main(argv=None):
                                    tty=getattr(args, 'tty', 'auto'))
             write_status(record)
             OUT['status_file'] = None
+            if leave:
+                target = read_leave(Path(c['state']) / 'run' / leave, c['uid'])
+                if target:
+                    write_owner(context['hook_file'], (map_out(c, target) + '\n').encode())
             return code
         emit(dict(result, state=state_of(c)))
         return 0
