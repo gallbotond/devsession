@@ -1,0 +1,5 @@
+# devsession directory marker (see README, "Directory activation").
+# Declarative data: one session name. It is never executed, cannot add
+# mounts, tools or network access, and has no effect until you run
+# `devsession allow` in this tree. Save it as .devsession.
+session = client-a

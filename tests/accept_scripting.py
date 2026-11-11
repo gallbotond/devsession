@@ -85,7 +85,7 @@ def state_lock(seconds):
 
 def codes(work):
     documented = jout('version')['exit_codes']
-    for code in ['0', '1', '3', '120', '121', '122', '123', '124', '125', '126', '127', '128+N']:
+    for code in ['0', '1', '3', '119', '120', '121', '122', '123', '124', '125', '126', '127', '128+N']:
         assert code in documented, code
     want(121, 'frobnicate')
     want(121, 'exec', '--env', 'NOEQUALS', NAME, '--', 'true')
