@@ -23,8 +23,35 @@ SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 BLOCKED = '0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 192.0.0.0/24, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4'
 
 
+VERSION = '0.2.0'
+# Exit statuses reserved for devsession itself. exec/shell pass the command's
+# own status through unchanged; 126/127/128+N keep their shell meaning.
+EXIT_ERROR, EXIT_USAGE, EXIT_NOSESSION, EXIT_PRIVILEGE, EXIT_BUSY, EXIT_CONFLICT = 120, 121, 122, 123, 124, 125
+KINDS = {EXIT_ERROR: 'error', EXIT_USAGE: 'usage', EXIT_NOSESSION: 'no-such-session',
+         EXIT_PRIVILEGE: 'privilege', EXIT_BUSY: 'busy', EXIT_CONFLICT: 'conflict'}
+EXIT_CODES = {'0': 'success; exec/shell: the command exited 0',
+              '1': 'exists: no such session; doctor: a required prerequisite is missing',
+              '3': 'status: the session exists but is stopped',
+              '120': 'devsession failed (operation error)',
+              '121': 'usage error',
+              '122': 'no such session',
+              '123': 'root privilege unavailable without a prompt',
+              '124': 'state lock busy for longer than --wait',
+              '125': 'conflict with existing state (exists, running, differs)',
+              '126': 'exec: command found but not executable',
+              '127': 'exec: command not found',
+              '128+N': 'exec/shell: command killed by signal N',
+              'other': 'exec/shell: the command\'s own exit status'}
+OUT = {'json': False, 'quiet': False, 'status_file': None, 'owner': None}
+
+
 class Error(Exception):
-    pass
+    code = EXIT_ERROR
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        if code is not None:
+            self.code = code
 
 
 def ipv4(value):
@@ -488,7 +515,7 @@ def start(c):
 
 def enter_args(c, command, fds):
     if not alive(c):
-        raise Error('Session is stopped; run devsession start NAME first')
+        raise Error('Session is stopped; run devsession start NAME first', EXIT_CONFLICT)
     pid = c['pid']
     args = ['nsenter', '--no-fork']
     # Pin namespace/root descriptors before releasing the lifecycle lock. A
@@ -500,59 +527,81 @@ def enter_args(c, command, fds):
         args += [f'--{option}=/proc/self/fd/{fd}']
     if not alive(c):
         raise Error('Session stopped while joining; retry after start')
-    return args + [f'--wdns={c.get("cwd", c["home"])}', '--', '/usr/bin/setpriv',
+    # Join at the session root; the unprivileged launcher selects the working
+    # directory afterwards so a missing directory is reported, not a join failure.
+    return args + ['--wdns=/', '--', '/usr/bin/setpriv',
             '--reuid', str(c['uid']), '--regid', str(c['gid']), '--clear-groups',
             '--bounding-set=-all', '--inh-caps=-all', '--ambient-caps=-all', '--no-new-privs',
             '--'] + command
 
 
-def execute(c, command, *, capture=False, overrides=None, release=None):
-    # Never inject session LD_PRELOAD/PYTHONPATH/etc into privileged nsenter or
-    # setpriv. Hand environment over only AFTER dropping all privileges.
-    fd = os.memfd_create('devsession-env', os.MFD_CLOEXEC)
-    os.write(fd, json.dumps(environment(c, overrides)).encode())
-    os.lseek(fd, 0, 0)
-    # Close all namespace/root descriptors before workload exec, including the
-    # root handle: no inherited setup handle should be reachable via /proc/fd.
-    fds = [fd]
-    # nsenter's default waiting parent does not forward directed signals. Its
-    # --no-fork form sets the child PID namespace; this unprivileged supervisor
-    # forks into it, forwards signals and returns the actual command status.
-    launcher = '''import os,sys,json,signal,pty,termios,tty,fcntl,select,errno
-f=os.fdopen(int(sys.argv[1])); e=json.load(f); f.close()
-os.closerange(3,4096); os.umask(0o077)
-interactive=os.isatty(0) and os.isatty(1)
+# Runs inside the session as the invoking UID (python3 -I -c). It applies the
+# environment and working directory after the privilege drop, supervises the
+# command, forwards signals and reports the outcome on a close-on-exec pipe
+# that the command never inherits.
+LAUNCHER = r'''import os,sys,json,signal,pty,termios,tty,fcntl,select,errno
+f=os.fdopen(int(sys.argv[1])); cfg=json.load(f); f.close()
+e=cfg['env']; sfd=cfg.get('status_fd',-1)
+if sfd>=3:
+ os.closerange(3,sfd); os.closerange(sfd+1,4096); os.set_inheritable(sfd,False)
+else:
+ os.closerange(3,4096)
+def report(**k):
+ if sfd>=3:
+  try: os.write(sfd,(json.dumps(k)+'\n').encode())
+  except OSError: pass
+os.umask(0o077)
+try: os.chdir(cfg['cwd'])
+except OSError as err:
+ report(error='cwd',errno=err.errno); sys.exit(120)
+mode=cfg.get('tty','auto'); intty=os.isatty(0)
+interactive=mode=='always' or (mode=='auto' and intty and os.isatty(1))
 if interactive:
  master,slave=pty.openpty()
  def resize(*unused):
-  try: fcntl.ioctl(master,termios.TIOCSWINSZ,fcntl.ioctl(0,termios.TIOCGWINSZ,b'\\0'*8))
+  try: fcntl.ioctl(master,termios.TIOCSWINSZ,fcntl.ioctl(0,termios.TIOCGWINSZ,b'\0'*8))
   except OSError: pass
  resize()
+SIGS=(signal.SIGINT,signal.SIGTERM,signal.SIGHUP,signal.SIGQUIT,signal.SIGUSR1,signal.SIGUSR2)
+r,w=os.pipe()
 child=os.fork()
 if child == 0:
+ os.close(r)
  if interactive:
   os.close(master); os.setsid(); fcntl.ioctl(slave,termios.TIOCSCTTY,0)
   for fd in (0,1,2): os.dup2(slave,fd)
   if slave>2: os.close(slave)
- for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(sig,signal.SIG_DFL)
- os.execvpe(sys.argv[2],sys.argv[2:],e)
+ # Python ignores SIGPIPE/SIGXFSZ and exec would pass that on to the command.
+ for sig in SIGS+(signal.SIGPIPE,signal.SIGXFSZ): signal.signal(sig,signal.SIG_DFL)
+ try: os.execvpe(sys.argv[2],sys.argv[2:],e)
+ except OSError as err:
+  os.write(w,str(err.errno).encode()); os._exit(127 if err.errno==errno.ENOENT else 126)
+os.close(w)
 def forward(sig,frame):
  try:
   if interactive: os.killpg(os.tcgetpgrp(master),sig)
   else: os.kill(child,sig)
  except (ProcessLookupError,OSError): pass
-for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(sig,forward)
+for sig in SIGS: signal.signal(sig,forward)
+failed=b''
+while True:
+ try: failed=os.read(r,32); break
+ except InterruptedError: pass
+os.close(r)
 if interactive:
  os.close(slave)
- signal.signal(signal.SIGWINCH,resize)
- previous=termios.tcgetattr(0)
  def sendall(fd,data):
   while data: data=data[os.write(fd,data):]
+ previous=None
+ if intty:
+  signal.signal(signal.SIGWINCH,resize)
+  previous=termios.tcgetattr(0)
  try:
-  tty.setraw(0)
+  if intty: tty.setraw(0)
   readers=[0,master]
   while True:
-   ready,_,_=select.select(readers,[],[])
+   try: ready,_,_=select.select(readers,[],[])
+   except InterruptedError: continue
    if master in ready:
     try: data=os.read(master,65536)
     except OSError as err:
@@ -561,19 +610,47 @@ if interactive:
     if not data: break
     sendall(1,data)
    if 0 in ready:
-    data=os.read(0,65536)
+    try: data=os.read(0,65536)
+    except OSError: data=b''
     if data: sendall(master,data)
-    else: readers.remove(0)
+    else:
+     readers.remove(0)
+     if not intty: sendall(master,b'\x04')
  finally:
-  termios.tcsetattr(0,termios.TCSADRAIN,previous); os.close(master)
-_,status=os.waitpid(child,0)
+  if previous is not None: termios.tcsetattr(0,termios.TCSADRAIN,previous)
+  os.close(master)
+while True:
+ try: _,status=os.waitpid(child,0); break
+ except InterruptedError: pass
 rc=os.waitstatus_to_exitcode(status)
+if failed: report(error='exec',errno=int(failed))
+elif rc<0: report(signal=-rc)
+else: report(exit=rc)
 sys.exit(rc if rc>=0 else 128-rc)
 '''
+FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2)
+
+
+def execute(c, command, *, capture=False, overrides=None, release=None, cwd=None, tty='auto'):
+    """Run argv in the session. Returns (exit status, attribution record)."""
+    # Never inject session LD_PRELOAD/PYTHONPATH/etc into privileged nsenter or
+    # setpriv. Hand environment over only AFTER dropping all privileges.
+    status_r, status_w = os.pipe()
+    target = cwd or c.get('cwd', c['home'])
+    fd = os.memfd_create('devsession-env', os.MFD_CLOEXEC)
+    os.write(fd, json.dumps(dict(env=environment(c, overrides), cwd=target,
+                                 tty=tty, status_fd=status_w)).encode())
+    os.lseek(fd, 0, 0)
+    # Close all namespace/root descriptors before workload exec, including the
+    # root handle: no inherited setup handle should be reachable via /proc/fd.
+    fds = [fd, status_w]
+    # nsenter's default waiting parent does not forward directed signals. Its
+    # --no-fork form sets the child PID namespace; the unprivileged supervisor
+    # forks into it, forwards signals and returns the actual command status.
     try:
-        args = enter_args(c, ['/usr/bin/python3', '-I', '-c', launcher, str(fd)] + command, fds)
+        args = enter_args(c, ['/usr/bin/python3', '-I', '-c', LAUNCHER, str(fd)] + command, fds)
     except BaseException:
-        for handle in fds:
+        for handle in fds + [status_r]:
             os.close(handle)
         raise
     safe = {'PATH': SYSTEM_PATH, 'LANG': 'C.UTF-8'}
@@ -581,24 +658,66 @@ sys.exit(rc if rc>=0 else 128-rc)
         try:
             return sp.run(args, env=safe, text=True, capture_output=True, pass_fds=tuple(fds))
         finally:
-            for handle in fds:
+            for handle in fds + [status_r]:
                 os.close(handle)
     try:
         p = sp.Popen(args, env=safe, pass_fds=tuple(fds))
+    except BaseException:
+        os.close(status_r)
+        raise
     finally:
         for handle in fds:
             os.close(handle)
     if release:
         release()
     old = {}
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    for sig in FORWARDED:
         old[sig] = signal.signal(sig, lambda s, f: p.send_signal(s) if p.poll() is None else None)
     try:
         rc = p.wait()
-        return rc if rc >= 0 else 128 - rc
     finally:
         for sig, handler in old.items():
             signal.signal(sig, handler)
+    rc = rc if rc >= 0 else 128 - rc
+    # The record is written by the unprivileged supervisor: untrusted data,
+    # bounded, and only ever interpreted as small integers.
+    os.set_blocking(status_r, False)
+    try:
+        raw = os.read(status_r, 4096)
+    except OSError:
+        raw = b''
+    os.close(status_r)
+    try:
+        report = json.loads(raw.decode('ascii', 'replace').splitlines()[0])
+        report = report if isinstance(report, dict) else {}
+    except (ValueError, IndexError):
+        report = {}
+    if isinstance(report.get('exit'), int) and 0 <= report['exit'] <= 255:
+        return report['exit'], dict(source='command', exit_code=report['exit'], signal=None, error=None)
+    if isinstance(report.get('signal'), int) and 1 <= report['signal'] <= 64:
+        return 128 + report['signal'], dict(source='command', exit_code=128 + report['signal'],
+                                           signal=report['signal'], error=None)
+    # Failures the supervisor could only detect inside the session. They are
+    # reported here, by devsession, in the caller's chosen format.
+    reason = os.strerror(report['errno']) if isinstance(report.get('errno'), int) else 'failed'
+    if report.get('error') == 'exec':
+        code = 127 if report.get('errno') == 2 else 126
+        kind, message = 'command-not-found' if code == 127 else 'not-executable', f'cannot execute {command[0]}: {reason}'
+    elif report.get('error') == 'cwd':
+        code, kind, message = EXIT_ERROR, 'working-directory', f'working directory {target}: {reason}'
+    else:  # no report: the join failed, or the supervisor was killed (session stop)
+        code, kind = rc if rc > 128 else EXIT_ERROR, 'interrupted'
+        message = 'the session was stopped or the join failed before the command reported a status'
+    complain(code, message, kind)
+    return code, dict(source='devsession', exit_code=code, signal=None, error=kind)
+
+
+def complain(code, message, kind=None):
+    """One error on stderr: text, or a single-line JSON object with --json."""
+    if OUT['json']:
+        print(json.dumps(dict(error=dict(kind=kind or KINDS.get(code, 'error'), exit_code=code, message=message))), file=sys.stderr)
+    else:
+        print(f'devsession: {message}', file=sys.stderr)
 
 
 def proxy_unit(c, port):
@@ -620,11 +739,15 @@ def stop(c):
     run(['ip', 'link', 'del', hostif], check=False)
     for family in ['inet', 'ip']:
         run(['nft', 'delete', 'table', family, table], check=False)
+    # Rewrite state only if this changed it: recovering an already stopped
+    # session (cleanup, a repeated stop) leaves its files byte-identical.
+    changed = c.get('phase') != 'stopped' or any(k in c for k in ('pid', 'birth', 'net_inode'))
     c.pop('pid', None)
     c.pop('birth', None)
     c.pop('net_inode', None)
     c['phase'] = 'stopped'
-    save(c)
+    if changed:
+        save(c)
 
 
 RESERVED_ENV = {'HOME', 'USER', 'LOGNAME', 'SHELL', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
@@ -659,23 +782,58 @@ def state_path(uid, name):
     return ROOT / f'{uid}-{name}'
 
 
+def normalize(c):
+    """Fill keys that older state files lack; nothing is written back here."""
+    for key, default in [('env', {}), ('mounts', []), ('tools', []), ('publish', []),
+                         ('allow_net', []), ('dns', ['1.1.1.1']), ('phase', 'stopped')]:
+        c.setdefault(key, type(default)(default))
+    c.setdefault('cwd', c['home'])
+    return c
+
+
 def configs(uid=None):
     for p in sorted(ROOT.glob('*/config.json')):
-        c = json.loads(p.read_text())
+        try:
+            c = normalize(json.loads(p.read_text()))
+        except FileNotFoundError:
+            continue  # deleted while listing; queries take no lock
+        except (ValueError, KeyError):
+            print(f'devsession: ignoring unreadable state {p.parent.name}', file=sys.stderr)
+            continue
         if uid is None or c['uid'] == uid:
             yield c
 
 
-def load(uid, name):
-    p = state_path(uid, name) / 'config.json'
-    if not p.exists():
-        raise Error(f'No session {name!r}; use devsession list')
-    return json.loads(p.read_text())
+def session_dir(uid, name):
+    """State directory of an existing session, or None."""
+    p = state_path(uid, name)
+    if (p / 'config.json').exists():
+        return p
+    # The first prototype wrote ROOT/NAME without the UID prefix. Such state
+    # still loads when its own recorded owner and name match.
+    legacy = ROOT / name
+    try:
+        c = json.loads((legacy / 'config.json').read_text())
+        if c.get('uid') == uid and c.get('name') == name:
+            return legacy
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def load(uid, name, missing_ok=False):
+    p = session_dir(uid, name)
+    if p:
+        with contextlib.suppress(FileNotFoundError):
+            return normalize(json.loads((p / 'config.json').read_text()))
+    if missing_ok:
+        return None
+    raise Error(f'No session {name!r}; use devsession list', EXIT_NOSESSION)
 
 
 def stopped(c):
     if alive(c):
-        raise Error('Stop the session before changing mounts, VPN or network mode')
+        raise Error('Stop the session before changing mounts, VPN or network mode', EXIT_CONFLICT)
     stop(c)  # recover any incomplete/stale setup before modifying it
 
 
@@ -763,11 +921,9 @@ def allocate():
     raise Error('No unused transport /30 in 10.231.0.0/16; host routes conflict with pool')
 
 
-def create(args, user, context):
+def build(args, user, context):
+    """Validate create options into a session configuration (no state written)."""
     import secrets
-    path = state_path(user.pw_uid, args.name)
-    if path.exists():
-        raise Error('Session already exists; use start or delete it first')
     mounts = [mount_spec(m, user.pw_dir) for m in args.mount]
     targets = [m['target'] for m in mounts]
     if any(a == b or a.startswith(b + '/') or b.startswith(a + '/')
@@ -777,9 +933,9 @@ def create(args, user, context):
     for p in [user.pw_dir + '/.local/bin', user.pw_dir + '/.opencode/bin', '/opt/devsession-tools/azure']:
         if Path(p).exists():
             tools.append(tool_path(p, user.pw_dir))
-    tools += [tool_path(p, user.pw_dir) for p in args.tool]
+    explicit = [tool_path(p, user.pw_dir) for p in args.tool]
     if args.host_tools:
-        tools += host_tools(context.get('path', SYSTEM_PATH), user.pw_dir)
+        explicit += host_tools(context.get('path', SYSTEM_PATH), user.pw_dir)
     publish = []
     for p in args.publish:
         a, b = map(int, p.split(':'))
@@ -788,17 +944,48 @@ def create(args, user, context):
         publish.append([a, b])
     if len({x[0] for x in publish}) != len(publish):
         raise Error('Duplicate published host port')
-    c = dict(name=args.name, tag=secrets.token_hex(5), state=str(path), uid=user.pw_uid, gid=user.pw_gid,
+    c = dict(name=args.name, tag=secrets.token_hex(5), state=str(state_path(user.pw_uid, args.name)),
+             uid=user.pw_uid, gid=user.pw_gid,
              user=user.pw_name, home=user.pw_dir, shell='/bin/bash', path=context.get('path', SYSTEM_PATH),
-             mode=args.net, dns=[ipv4(x) for x in (args.dns or ['1.1.1.1'])],
+             mode=args.net or 'off', dns=[ipv4(x) for x in (args.dns or ['1.1.1.1'])],
              allow_net=[str(ipaddress.IPv4Network(x, strict=False)) for x in args.allow_net],
-             mounts=mounts, tools=list(dict.fromkeys(tools)), publish=publish,
-             transport=allocate(), env={}, phase='stopped',
+             mounts=mounts, tools=list(dict.fromkeys(tools + explicit)), publish=publish,
+             env={}, phase='stopped',
              cwd=absolute(args.cwd) if args.cwd else (mounts[0]['target'] if mounts and Path(mounts[0]['source']).is_dir() else user.pw_dir))
     # Do not import startup files implicitly. This file is an explicit policy.
     rc = "[ -f ~/.bashrc ] && source ~/.bashrc\nPS1='[${DEVSESSION}] \\u@\\h:\\w\\$ '\n"
     if args.shell_rc:
         rc = Path(args.shell_rc).read_text() + '\n[ -f ~/.bashrc ] && source ~/.bashrc\n'
+    return c, rc, explicit
+
+
+def create(args, user, context):
+    """Returns True when a session was created, False for a satisfied --ensure."""
+    existing = load(user.pw_uid, args.name, missing_ok=True)
+    if existing and not args.ensure:
+        raise Error('Session already exists; use start or delete it first (or create --ensure)', EXIT_CONFLICT)
+    c, rc, explicit = build(args, user, context)
+    if existing:
+        # --ensure: the session must already agree with every option that was
+        # given explicitly. Nothing is modified; a mismatch is a conflict.
+        differs = [field for field, given, same in [
+            ('mount', args.mount, existing['mounts'] == c['mounts']),
+            ('tool', explicit, set(explicit) <= set(existing['tools'])),
+            ('net', args.net, existing['mode'] == c['mode']),
+            ('dns', args.dns, existing['dns'] == c['dns']),
+            ('allow-net', args.allow_net, existing['allow_net'] == c['allow_net']),
+            ('publish', args.publish, existing['publish'] == c['publish']),
+            ('cwd', args.cwd, existing['cwd'] == c['cwd']),
+            ('shell-rc', args.shell_rc, (Path(existing['state']) / 'shellrc').read_text() == rc),
+        ] if given and not same]
+        if differs:
+            raise Error('Session exists with different --' + ', --'.join(differs) +
+                        '; delete it first or omit those options', EXIT_CONFLICT)
+        return False
+    if (ROOT / args.name).exists():
+        raise Error('A session directory of that name from an older layout exists', EXIT_CONFLICT)
+    c['transport'] = allocate()
+    path = Path(c['state'])
     # Build in a root-only staging directory then publish the complete state in
     # one rename. Interrupted creates cannot reserve a broken session name.
     staging = ROOT / ('.create-' + c['tag'])
@@ -809,98 +996,306 @@ def create(args, user, context):
         staging.rename(path)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    print(f'Created {args.name}; run devsession shell {args.name}')
+    return True
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Error(f'{message} (try: {self.prog} --help)', EXIT_USAGE)
+
+
+def common(top):
+    """Options accepted both before and after the subcommand."""
+    absent = (lambda value: value) if top else (lambda value: argparse.SUPPRESS)
+    p = argparse.ArgumentParser(add_help=False)
+    g = p.add_argument_group('scripting options')
+    g.add_argument('--json', action='store_true', default=absent(False),
+                   help='Machine-readable results on stdout and one JSON error object on stderr')
+    g.add_argument('-q', '--quiet', action='store_true', default=absent(False), help='No informational text')
+    g.add_argument('--wait', type=float, metavar='SECONDS', default=absent(None),
+                   help='Longest wait for the state lock (0: fail at once, negative: no limit). '
+                        'Default 0 for changes, no limit for exec/shell/credential; env DEVSESSION_WAIT')
+    g.add_argument('--non-interactive', action='store_true', default=absent(False),
+                   help='Never prompt: fail with status 123 if sudo would need a password; env DEVSESSION_NONINTERACTIVE=1')
+    g.add_argument('--user', metavar='NAME', default=absent(None),
+                   help='Session owner; only when devsession itself is started by root (service, root cron)')
+    return p
 
 
 def parser():
-    p = argparse.ArgumentParser(prog='devsession', description='Isolated Linux development sessions using host tools. Setup needs sudo; workloads never run as root.')
-    sub = p.add_subparsers(dest='action', required=True)
-    c = sub.add_parser('create', help='Create persistent private state (default network: off)')
+    opts = common(False)
+    p = Parser(prog='devsession', parents=[common(True)],
+               description='Isolated Linux development sessions using host tools. Setup needs sudo; workloads never run as root.',
+               epilog='Exit status: ' + '; '.join(f'{k} {v}' for k, v in EXIT_CODES.items()))
+    p.add_argument('--version', action='version', version=VERSION)
+    sub = p.add_subparsers(dest='action', required=True, parser_class=Parser)
+    def add(parent, name, **kw):
+        return parent.add_parser(name, parents=[opts], **kw)
+    c = add(sub, 'create', help='Create persistent private state (default network: off)')
     c.add_argument('name'); c.add_argument('--mount', action='append', default=[], metavar='SOURCE:TARGET[:ro|rw]')
     c.add_argument('--tool', action='append', default=[], metavar='PATH', help='Explicit read-only host installation tree at the same absolute path')
     c.add_argument('--host-tools', action='store_true', help='Also mount, read-only, the installation tree of every host PATH entry outside /usr; inspect NAME lists them')
     c.add_argument('--shell-rc', help='Reviewed reusable Bash customization file (explicit trust/import)')
-    c.add_argument('--cwd'); c.add_argument('--net', choices=['off', 'direct'], default='off')
+    c.add_argument('--cwd'); c.add_argument('--net', choices=['off', 'direct'])
     c.add_argument('--dns', action='append', metavar='IPv4'); c.add_argument('--allow-net', action='append', default=[], metavar='CIDR')
     c.add_argument('--publish', action='append', default=[], metavar='HOSTPORT:SESSIONPORT', help='Explicit loopback TCP proxy; requires systemd and socat')
-    for op in ['start', 'stop', 'delete', 'inspect', 'shell']:
-        q = sub.add_parser(op); q.add_argument('name')
+    c.add_argument('--ensure', action='store_true', help='Succeed if the session already exists and agrees with the options given; never modifies it')
+    for op in ['start', 'stop', 'delete', 'inspect', 'shell', 'status', 'exists']:
+        q = add(sub, op, help={'status': 'Exit 0 running, 3 stopped, 122 absent',
+                               'exists': 'Exit 0 if the session exists, 1 if not'}.get(op))
+        q.add_argument('name')
+        if op in ['stop', 'delete']:
+            q.add_argument('--if-exists', action='store_true', help='Succeed when there is no such session')
         if op == 'shell':
             q.add_argument('--forward', action='append', default=[], metavar='VARIABLE')
-    q = sub.add_parser('exec', help='Run argv without shell interpolation, auto-starting if necessary')
+            q.add_argument('--cwd', metavar='DIR', help='Working directory inside the session')
+    q = add(sub, 'exec', help='Run argv without shell interpolation, auto-starting if necessary')
     q.add_argument('--forward', action='append', default=[], metavar='VARIABLE')
+    q.add_argument('--cwd', metavar='DIR', help='Working directory inside the session for this call')
+    q.add_argument('--env', action='append', default=[], metavar='NAME=VALUE',
+                   help='Variable for this call only (visible in host process listings; use --env-file for secrets)')
+    q.add_argument('--env-file', action='append', default=[], metavar='FILE', help='Literal NAME=value lines for this call only')
+    g = q.add_mutually_exclusive_group()
+    g.add_argument('-t', '--tty', dest='tty', action='store_const', const='always', default='auto',
+                   help='Always give the command a pseudo-terminal')
+    g.add_argument('-T', '--no-tty', dest='tty', action='store_const', const='never',
+                   help='Never allocate a pseudo-terminal (binary-clean stdio even on a terminal)')
+    q.add_argument('--no-start', action='store_true', help='Fail with status 125 instead of starting a stopped session')
+    q.add_argument('--status-file', metavar='FILE',
+                   help='Write a JSON record saying whether the exit status is the command\'s or devsession\'s')
     q.add_argument('name'); q.add_argument('command', nargs=argparse.REMAINDER)
-    sub.add_parser('list'); sub.add_parser('doctor', help='Report prerequisites and host tool paths')
-    sub.add_parser('cleanup', help='Clean stale owned resources; restore forwarding if all sessions stopped')
-    e = sub.add_parser('env', help='Session environment; files are literal NAME=value data').add_subparsers(dest='env_action', required=True)
-    q = e.add_parser('set'); q.add_argument('name'); q.add_argument('key'); q.add_argument('value', nargs='?')
+    add(sub, 'list'); add(sub, 'doctor', help='Report prerequisites and host tool paths; exit 1 if a required one is missing')
+    add(sub, 'version', help='Print the version (and the exit-status table with --json)')
+    add(sub, 'cleanup', help='Clean stale owned resources; restore forwarding if all sessions stopped')
+    e = add(sub, 'env', help='Session environment; files are literal NAME=value data').add_subparsers(dest='env_action', required=True, parser_class=Parser)
+    q = add(e, 'set'); q.add_argument('name'); q.add_argument('key'); q.add_argument('value', nargs='?')
     g = q.add_mutually_exclusive_group(); g.add_argument('--stdin', action='store_true'); g.add_argument('--file')
-    q = e.add_parser('import'); q.add_argument('name'); q.add_argument('file', help='File or - for stdin')
-    q = e.add_parser('unset'); q.add_argument('name'); q.add_argument('key')
-    n = sub.add_parser('net').add_subparsers(dest='net_action', required=True)
-    q = n.add_parser('set'); q.add_argument('name'); q.add_argument('mode', choices=['off', 'direct', 'vpn'])
-    v = sub.add_parser('vpn').add_subparsers(dest='vpn_action', required=True)
-    q = v.add_parser('configure'); q.add_argument('name')
+    q = add(e, 'import'); q.add_argument('name'); q.add_argument('file', help='File or - for stdin')
+    q = add(e, 'unset'); q.add_argument('name'); q.add_argument('key')
+    n = add(sub, 'net').add_subparsers(dest='net_action', required=True, parser_class=Parser)
+    q = add(n, 'set'); q.add_argument('name'); q.add_argument('mode', choices=['off', 'direct', 'vpn'])
+    v = add(sub, 'vpn').add_subparsers(dest='vpn_action', required=True, parser_class=Parser)
+    q = add(v, 'configure'); q.add_argument('name')
     g = q.add_mutually_exclusive_group(required=True); g.add_argument('--wireguard'); g.add_argument('--openvpn')
     q.add_argument('--dns', action='append', metavar='IPv4')
-    q = sub.add_parser('credential', help='Import stdin/file into private HOME, never argv; auto-starts session')
+    q = add(sub, 'credential', help='Import stdin/file into private HOME, never argv; auto-starts session')
     q.add_argument('name'); q.add_argument('destination', help='Relative path in private HOME, e.g. .ssh/id_ed25519')
     q.add_argument('--file', help='Default is stdin')
     return p
 
 
+REQUIRED = ['bwrap', 'ip', 'nft', 'nsenter', 'setpriv', 'python3']
+
+
 def doctor(context):
     cmds = ['bwrap', 'ip', 'nft', 'nsenter', 'setpriv', 'wg', 'openvpn', 'socat',
             'terraform', 'ansible', 'tmux', 'oh-my-posh', 'az', 'python3', 'node', 'rustc', 'mise', 'pyenv']
-    for cmd in cmds:
-        found = shutil.which(cmd, path=context.get('path', SYSTEM_PATH))
-        print(f'{cmd}: {found or "MISSING"}' + (f' -> {Path(found).resolve()}' if found else ''))
+    found = {cmd: shutil.which(cmd, path=context.get('path', SYSTEM_PATH)) for cmd in cmds}
+    missing = [cmd for cmd in REQUIRED if not found[cmd]]
+    if OUT['json']:
+        print(json.dumps(dict(version=VERSION, ok=not missing, missing_required=missing, commands={
+            cmd: dict(path=path, resolved=str(Path(path).resolve()) if path else None, required=cmd in REQUIRED)
+            for cmd, path in found.items()}), indent=2))
+        return 1 if missing else 0
+    for cmd, path in found.items():
+        print(f'{cmd}: {path or "MISSING"}' + (f' -> {Path(path).resolve()}' if path else ''))
     print('Requires Bubblewrap >=0.11 (--bind-fd), util-linux nsenter --wdns, nftables, user/network/mount/PID namespaces.')
     print('Default installation mounts: /usr + merged-usr libraries; ~/.local/bin, ~/.opencode/bin, /opt/devsession-tools/azure when present.')
     print('Additional runtimes/toolchains: create --tool PATH; inspect NAME shows all approved mounts.')
+    return 1 if missing else 0
 
 
-def main():
-    args = parser().parse_args()
+def invocation(args):
+    """Explicit per-call data from the invoking environment; literal values only."""
+    forwards = {env_key(k): os.environ[k] for k in getattr(args, 'forward', []) if k in os.environ}
+    extra = {}
+    for name in getattr(args, 'env_file', []):
+        extra.update(env_file(Path(name).read_text()))
+    for item in getattr(args, 'env', []):
+        if '=' not in item:
+            raise Error('--env needs NAME=VALUE', EXIT_USAGE)
+        k, v = item.split('=', 1)
+        if '\0' in v:
+            raise Error('NUL is forbidden in environment data', EXIT_USAGE)
+        extra[env_key(k)] = v
+    wait = args.wait
+    if wait is None and os.environ.get('DEVSESSION_WAIT'):
+        try:
+            wait = float(os.environ['DEVSESSION_WAIT'])
+        except ValueError:
+            raise Error('DEVSESSION_WAIT must be a number of seconds', EXIT_USAGE)
+    return dict(path=os.environ.get('PATH', SYSTEM_PATH), forward=forwards, env=extra, wait=wait,
+                status_file=os.path.abspath(args.status_file) if getattr(args, 'status_file', None) else None,
+                terminal={k: os.environ[k] for k in ['TERM', 'COLORTERM', 'LANG'] if k in os.environ})
+
+
+def can_prompt(args):
+    if args.non_interactive or os.environ.get('DEVSESSION_NONINTERACTIVE', '0') not in ('', '0'):
+        return False
+    try:
+        os.close(os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY))
+        return True
+    except OSError:
+        return False
+
+
+def lock_state(wait):
+    """Exclusive state lock with a bounded wait (None or negative: no limit)."""
+    lock = open(ROOT / '.lock', 'a')
+    if wait is None or wait < 0:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return lock
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                lock.close()
+                raise Error('Another lifecycle operation is in progress; retry shortly or pass --wait SECONDS', EXIT_BUSY)
+            time.sleep(.05)
+
+
+def write_status(record):
+    """Attribution record for exec --status-file, written with the caller's own rights."""
+    path = OUT.get('status_file')
+    if not path:
+        return
+    data = (json.dumps(record) + '\n').encode() if record else b''
+    def store():
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        os.write(fd, data); os.close(fd)
+    owner = OUT.get('owner')
+    if os.geteuid() != 0 or owner is None:
+        with contextlib.suppress(OSError):
+            store()
+        return
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.initgroups(owner.pw_name, owner.pw_gid); os.setgid(owner.pw_gid); os.setuid(owner.pw_uid)
+            store()
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+    os.waitpid(pid, 0)
+
+
+def emit(result, text=None):
+    if OUT['json']:
+        print(json.dumps(result, indent=2))
+    elif text and not OUT['quiet']:
+        print(text)
+
+
+def state_of(c):
+    return 'running' if alive(c) else 'stopped'
+
+
+def summary(c):
+    return dict(name=c['name'], state=state_of(c), running=alive(c), mode=c['mode'], phase=c.get('phase', 'stopped'))
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    # A caller may have closed stdin/stdout/stderr. Occupy the slots so that
+    # no internal descriptor (lock, status pipe) is ever handed on as stdio.
+    for fd in (0, 1, 2):
+        try:
+            os.fstat(fd)
+        except OSError:
+            os.set_inheritable(os.open(os.devnull, os.O_RDWR), True)
+    OUT['json'] = '--json' in (argv[:argv.index('--')] if '--' in argv else argv)
+    args = parser().parse_args(argv)
+    OUT.update(json=args.json, quiet=args.quiet)
+    if args.action == 'version':
+        emit(dict(version=VERSION, exit_codes=EXIT_CODES), VERSION)
+        return 0
+    direct_root = os.geteuid() == 0 and 'SUDO_UID' not in os.environ
+    if args.user and not direct_root:
+        raise Error('--user is only for invocations started by root itself, not through sudo', EXIT_USAGE)
     if os.geteuid() != 0:
-        forwards = {env_key(k): os.environ[k] for k in getattr(args, 'forward', []) if k in os.environ}
-        context = dict(path=os.environ.get('PATH', SYSTEM_PATH), forward=forwards,
-                       terminal={k: os.environ[k] for k in ['TERM', 'COLORTERM', 'LANG'] if k in os.environ})
+        context = invocation(args)
+        OUT['status_file'] = context['status_file']
+        write_status(None)  # a stale record must never be mistaken for this call's
         if args.action == 'doctor':
-            doctor(context)
-            return 0
+            return doctor(context)
         # No arbitrary host environment, agent socket or token is inherited by
         # the privileged interpreter. -I ignores Python discovery variables.
-        os.execve('/usr/bin/sudo', ['sudo', '--preserve-env=DEVSESSION_CONTEXT', '--',
-                  '/usr/bin/python3', '-I', str(Path(__file__).resolve())] + sys.argv[1:],
-                  {'PATH': SYSTEM_PATH, 'TERM': os.environ.get('TERM', 'xterm'),
-                   'DEVSESSION_CONTEXT': json.dumps(context)})
-    context = json.loads(os.environ.pop('DEVSESSION_CONTEXT', '{}'))
-    user = pwd.getpwuid(int(os.environ.get('SUDO_UID', os.getuid())))
+        clean = {'PATH': SYSTEM_PATH, 'TERM': os.environ.get('TERM', 'xterm')}
+        sudo = ['sudo']
+        if not can_prompt(args):
+            # Unattended: never let sudo prompt. A separate probe gives this
+            # failure its own status instead of sudo's generic 1.
+            if sp.run(['/usr/bin/sudo', '-n', 'true'], stdin=sp.DEVNULL, stdout=sp.DEVNULL,
+                      stderr=sp.DEVNULL, env=clean).returncode:
+                raise Error('Root privilege is required, sudo needs a password and no prompt is possible '
+                            '(no terminal, or --non-interactive). Use an account with passwordless sudo, '
+                            'refresh the credential first (sudo -v), or run as root with --user NAME',
+                            EXIT_PRIVILEGE)
+            sudo.append('-n')
+        os.execve('/usr/bin/sudo', sudo + ['--preserve-env=DEVSESSION_CONTEXT', '--',
+                  '/usr/bin/python3', '-I', str(Path(__file__).resolve())] + argv,
+                  dict(clean, DEVSESSION_CONTEXT=json.dumps(context)))
+    if 'DEVSESSION_CONTEXT' in os.environ:
+        context = json.loads(os.environ.pop('DEVSESSION_CONTEXT'))
+    else:
+        context = invocation(args)  # started by root itself: this is the invoking environment
+    try:
+        user = pwd.getpwnam(args.user) if args.user else pwd.getpwuid(int(os.environ.get('SUDO_UID', os.getuid())))
+    except KeyError:
+        raise Error(f'Unknown user: {args.user}', EXIT_USAGE)
+    OUT.update(status_file=context.get('status_file'), owner=user if user.pw_uid else None)
     if user.pw_uid == 0 and args.action not in ['doctor', 'cleanup', 'list']:
-        raise Error('Invoke as a normal host user (or via sudo from that user); root workloads are forbidden')
+        raise Error('Invoke as a normal host user (or via sudo from that user, or as root with --user NAME); '
+                    'root workloads are forbidden', EXIT_USAGE)
     os.environ.clear(); os.environ.update(PATH=SYSTEM_PATH, LANG='C.UTF-8')
     os.umask(0o077)
     ROOT.mkdir(mode=0o711, exist_ok=True)
-    lock = open(ROOT / '.lock', 'a')
-    try:
-        flags = fcntl.LOCK_EX
-        if args.action not in ['exec', 'shell', 'credential', 'inspect', 'list']:
-            flags |= fcntl.LOCK_NB
-        fcntl.flock(lock, flags)
-    except BlockingIOError:
-        raise Error('Another lifecycle operation is in progress; retry shortly')
+    if args.action == 'doctor':
+        return doctor(context)
+    # Read-only queries take no lock: state files are replaced atomically, so
+    # a query never blocks behind (or delays) a long-running start.
+    if args.action == 'list':
+        sessions = list(configs(user.pw_uid if user.pw_uid else None))
+        if OUT['json']:
+            print(json.dumps(dict(sessions=[summary(c) for c in sessions]), indent=2))
+        else:
+            for c in sessions:
+                print(f'{c["name"]}\t{state_of(c)}\t{c["mode"]}')
+        return 0
+    if args.action in ['exists', 'status']:
+        c = load(user.pw_uid, args.name, missing_ok=True)
+        if args.action == 'exists':
+            emit(dict(name=args.name, exists=bool(c)))
+            return 0 if c else 1
+        if not c:
+            emit(dict(name=args.name, exists=False, state='absent', running=False), 'absent')
+            return EXIT_NOSESSION
+        emit(dict(summary(c), exists=True), state_of(c))
+        return 0 if alive(c) else 3
+    if args.action == 'inspect':
+        c = load(user.pw_uid, args.name)
+        public = dict(c)
+        public['env'] = {k: '<redacted>' for k in c['env']}
+        public['running'] = alive(c)
+        public['namespaces'] = dict(zip(['workload', 'gateway', 'host_veth', 'nft_table'], names(c)))
+        print(json.dumps(public, indent=2))
+        return 0
+    wait = context.get('wait')
+    if wait is None and args.action not in ['exec', 'shell', 'credential']:
+        wait = 0
+    lock = lock_state(wait)
     def release():
         if not lock.closed:
             lock.close()
     try:
+        result = dict(action=args.action, changed=True)
         if args.action == 'create':
-            create(args, user, context); return 0
-        if args.action == 'doctor':
-            doctor(context); return 0
-        if args.action == 'list':
-            for c in configs(user.pw_uid if user.pw_uid else None):
-                print(f'{c["name"]}\t{"running" if alive(c) else "stopped"}\t{c["mode"]}')
+            result.update(name=args.name, changed=create(args, user, context))
+            emit(result, f'Created {args.name}; run devsession shell {args.name}' if result['changed']
+                 else f'Session {args.name} already exists')
             return 0
         if args.action == 'cleanup':
             for p in ROOT.glob('.create-*'):
@@ -911,39 +1306,45 @@ def main():
             if not any(alive(c) for c in configs()) and (ROOT / 'forwarding-before').exists():
                 run(['sysctl', '-qw', 'net.ipv4.ip_forward=' + (ROOT / 'forwarding-before').read_text().strip()])
                 (ROOT / 'forwarding-before').unlink()
+            emit(result)
             return 0
-        c = load(user.pw_uid, args.name)
+        c = load(user.pw_uid, args.name, missing_ok=getattr(args, 'if_exists', False))
+        result['name'] = args.name
+        if c is None:  # stop/delete --if-exists
+            emit(dict(result, changed=False, state='absent'))
+            return 0
         if args.action == 'start':
+            result['changed'] = not alive(c)
             start(c)
         elif args.action in ['stop', 'delete']:
+            result['changed'] = args.action == 'delete' or alive(c) or c.get('phase') != 'stopped'
             stop(c)
             if args.action == 'delete':
                 shutil.rmtree(c['state'])
-        elif args.action == 'inspect':
-            public = dict(c)
-            public['env'] = {k: '<redacted>' for k in c['env']}
-            public['running'] = alive(c)
-            public['namespaces'] = dict(zip(['workload', 'gateway', 'host_veth', 'nft_table'], names(c)))
-            print(json.dumps(public, indent=2))
+                emit(dict(result, state='absent'))
+                return 0
         elif args.action == 'env':
             if args.env_action == 'set':
                 k = env_key(args.key)
                 if args.value is not None and (args.stdin or args.file):
-                    raise Error('Use a value OR --stdin/--file')
+                    raise Error('Use a value OR --stdin/--file', EXIT_USAGE)
                 value = sys.stdin.read().removesuffix('\n') if args.stdin else Path(args.file).read_text().removesuffix('\n') if args.file else args.value
                 if value is None or '\0' in value:
-                    raise Error('Supply a value, --stdin or --file (NUL is forbidden)')
+                    raise Error('Supply a value, --stdin or --file (NUL is forbidden)', EXIT_USAGE)
                 c['env'][k] = value
             elif args.env_action == 'import':
                 c['env'].update(env_file(sys.stdin.read() if args.file == '-' else Path(args.file).read_text()))
             else:
-                c['env'].pop(env_key(args.key), None)
+                result['changed'] = c['env'].pop(env_key(args.key), None) is not None
             save(c)
         elif args.action == 'net':
-            stopped(c)
-            if args.mode == 'vpn' and not c.get('vpn'):
-                raise Error('Configure WireGuard or OpenVPN before selecting VPN mode')
-            c['mode'] = args.mode; save(c)
+            if c['mode'] == args.mode:
+                result['changed'] = False  # already so: no stop is required
+            else:
+                stopped(c)
+                if args.mode == 'vpn' and not c.get('vpn'):
+                    raise Error('Configure WireGuard or OpenVPN before selecting VPN mode', EXIT_CONFLICT)
+                c['mode'] = args.mode; save(c)
         elif args.action == 'vpn':
             stopped(c)
             folder = Path(c['state']) / 'vpn'
@@ -960,15 +1361,19 @@ def main():
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
         elif args.action in ['exec', 'shell', 'credential']:
+            if getattr(args, 'no_start', False) and not alive(c):
+                raise Error('Session is stopped and exec --no-start was given', EXIT_CONFLICT)
             start(c)
             extra = dict(context.get('terminal', {}))
             extra.update({env_key(k): v for k, v in context.get('forward', {}).items()})
+            extra.update({env_key(k): v for k, v in context.get('env', {}).items()})
+            cwd = absolute(args.cwd) if getattr(args, 'cwd', None) else None
             if args.action == 'shell':
                 command = ['/bin/bash', '--noprofile', '--rcfile', '/etc/devsession.bashrc', '-i']
             elif args.action == 'credential':
                 dest = Path(args.destination)
                 if dest.is_absolute() or '..' in dest.parts or not dest.parts:
-                    raise Error('Credential destination must be a relative path inside private HOME')
+                    raise Error('Credential destination must be a relative path inside private HOME', EXIT_USAGE)
                 # Copy inside the isolated filesystem, as the unprivileged user;
                 # symlinks cannot make the helper write to host private paths.
                 command = ['/usr/bin/python3', '-I', '-c',
@@ -980,18 +1385,36 @@ def main():
                 if command[:1] == ['--']:
                     command = command[1:]
                 if not command:
-                    raise Error('exec needs a command after NAME --')
-            return execute(c, command, overrides=extra, release=release)
+                    raise Error('exec needs a command after NAME --', EXIT_USAGE)
+            code, record = execute(c, command, overrides=extra, release=release, cwd=cwd,
+                                   tty=getattr(args, 'tty', 'auto'))
+            write_status(record)
+            OUT['status_file'] = None
+            return code
+        emit(dict(result, state=state_of(c)))
         return 0
     finally:
         release()
 
 
+def fail(code, message):
+    complain(code, message)
+    write_status(dict(source='devsession', exit_code=code, signal=None, error=KINDS.get(code, 'error')))
+    return code
+
+
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (Error, ValueError, OSError) as e:
-        print(f'devsession: {e}', file=sys.stderr)
-        sys.exit(2)
+    except Error as e:
+        sys.exit(fail(e.code, str(e)))
+    except BrokenPipeError:
+        # The reader of our own output went away; behave like a SIGPIPE death.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+        sys.exit(141)
+    except (ValueError, OSError) as e:
+        sys.exit(fail(EXIT_ERROR, str(e)))
     except KeyboardInterrupt:
         sys.exit(130)
+    except Exception as e:  # never a bare traceback with an unreserved status
+        sys.exit(fail(EXIT_ERROR, f'internal error: {type(e).__name__}: {e}'))

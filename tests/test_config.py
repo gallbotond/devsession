@@ -62,6 +62,35 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(os.stat(out / 'auth-user-pass.data').st_mode & 0o777, 0o600)
             self.assertIn('redirect-gateway def1', (out / 'client.ovpn').read_text())
 
+    def test_usage_errors_use_reserved_status_not_argparse_2(self):
+        for argv in [['frobnicate'], ['exec'], ['create'], ['net', 'set', 'x', 'sideways']]:
+            with self.subTest(argv=argv), self.assertRaises(ds.Error) as raised:
+                ds.parser().parse_args(argv)
+            self.assertEqual(raised.exception.code, ds.EXIT_USAGE)
+
+    def test_common_options_before_or_after_the_subcommand(self):
+        for argv in [['--json', '--wait', '5', 'list'], ['list', '--json', '--wait', '5']]:
+            args = ds.parser().parse_args(argv)
+            self.assertEqual((args.json, args.wait, args.quiet), (True, 5.0, False))
+        args = ds.parser().parse_args(['exec', '-T', '--cwd', '/w', 'name', '--', 'ls', '--json'])
+        command = args.command[1:] if args.command[:1] == ['--'] else args.command  # argparse versions differ
+        self.assertEqual((args.json, args.tty, command), (False, 'never', ['ls', '--json']))
+
+    def test_reserved_statuses_are_documented_and_distinct(self):
+        codes = [ds.EXIT_ERROR, ds.EXIT_USAGE, ds.EXIT_NOSESSION, ds.EXIT_PRIVILEGE, ds.EXIT_BUSY, ds.EXIT_CONFLICT]
+        self.assertEqual(codes, [120, 121, 122, 123, 124, 125])
+        self.assertTrue(all(str(code) in ds.EXIT_CODES and code in ds.KINDS for code in codes))
+
+    def test_older_state_is_normalized_without_new_keys_being_required(self):
+        c = ds.normalize(dict(name='p', uid=1, home='/home/p', mode='vpn'))
+        self.assertEqual((c['env'], c['mounts'], c['publish'], c['cwd'], c['phase']), ({}, [], [], '/home/p', 'stopped'))
+
+    def test_per_call_environment_is_literal_and_reserved_names_refused(self):
+        self.assertEqual(ds.env_file('A=$(id)\n# c\n\nB= x y \n'), {'A': '$(id)', 'B': ' x y '})
+        for bad in ['HOME=/x', 'DEVSESSION=other', '1A=b', 'novalue']:
+            with self.subTest(bad=bad), self.assertRaises(ds.Error):
+                ds.env_file(bad + '\n')
+
 
 if __name__ == '__main__':
     unittest.main()
