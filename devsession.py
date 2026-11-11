@@ -591,6 +591,11 @@ def start_tailscale(c, gateway, login_timeout=45):
     done = ts(c, *up, check=False, timeout=login_timeout + 15)
     if done is None or done.returncode:
         detail = printable((done.stderr.strip() or done.stdout.strip()) if done else 'timed out')[:300]
+        if key.is_file():
+            # A control server may quote the key's identifier back; no part of the key is shown.
+            for part in re.split(r'[^A-Za-z0-9]+', key.read_text()):
+                if len(part) >= 8:
+                    detail = detail.replace(part, '<redacted>')
         raise Error('Tailscale login or configuration failed (check the auth key, login server and exit node): ' + detail)
     ts(c, 'set', '--auto-update=false', '--webclient=false', '--relay-server-port=', check=False)
     ts(c, 'serve', 'reset', check=False)
@@ -633,7 +638,9 @@ def tailscale_logout(c):
     if v.get('kind') != 'tailscale' or not (ts_paths(c)[2] / 'tailscaled.state').exists():
         return None
     try:
-        if not (alive(c) and c['mode'] == 'vpn'):
+        # A running session whose daemon died cannot log out either: bring
+        # the gateway and daemon up again from the persisted node state.
+        if not (alive(c) and c['mode'] == 'vpn' and ts_status(c).get('BackendState') == 'Running'):
             stop(c)
             c['mode'] = 'vpn'
             network(c, login_timeout=15)

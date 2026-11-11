@@ -481,7 +481,17 @@ def persistence(work, state):
     eq(json.loads(cli('--json', 'delete', 'ts-o').stdout).get('tailscale_logout'), True)
     left = [n for n in json.loads(lab('hs', 'nodes', 'list').stdout) if n['given_name'] == 'one-time-b']
     assert not left or left[0].get('expiry', {}).get('seconds'), left
-    return 'one-time key: same node ID and address after stop/start; delete logged the node out, running or stopped'
+    # And a running session whose daemon has died: the node is still logged out, not orphaned.
+    key = lab('authkey').stdout.strip()
+    cli('create', 'ts-o')
+    cli('vpn', 'configure', 'ts-o', '--tailscale', '--auth-key-stdin', '--login-server', URL, '--ca-file',
+        LAB / 'ts-ca.crt', *NETS, '--hostname', 'one-time-c', input=key + '\n')
+    cli('net', 'set', 'ts-o', 'vpn'); cli('start', 'ts-o')
+    root('kill', '-KILL', str(daemon('ts-o')))
+    eq(json.loads(cli('--json', 'delete', 'ts-o').stdout).get('tailscale_logout'), True)
+    left = [n for n in json.loads(lab('hs', 'nodes', 'list').stdout) if n['given_name'] == 'one-time-c']
+    assert not left or left[0].get('expiry', {}).get('seconds'), left
+    return 'one-time key: same node ID and address after stop/start; delete logged the node out: running, stopped, and running with a dead daemon'
 
 
 def unchanged(state):
