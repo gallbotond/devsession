@@ -136,6 +136,56 @@ class ConfigTests(unittest.TestCase):
                     ds.mount_spec(source + ':/x', home)
             self.assertEqual(ds.mount_spec(home + '/proj:/x', home)['target'], '/x')
 
+    def tailscale_args(self, **overrides):
+        import argparse
+        base = dict(name='work', exit_node=None, accept_routes=False, hostname=None, dns=None, transport_net=[],
+                    login_server=None, auth_key_stdin=False, auth_key_file=None, ca_file=None, previous_dir='/nonexistent')
+        return argparse.Namespace(**dict(base, **overrides))
+
+    def test_tailscale_configuration_holds_no_secret_and_only_safe_options(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t)
+            (p / 'key').write_text('tskey-auth-UNITTESTSENTINEL\n')
+            v = ds.tailscale_import(self.tailscale_args(auth_key_file=str(p / 'key'), exit_node='peer-1',
+                                                        login_server='https://203.0.113.9:8443/', transport_net=['10.9.8.7/24']), p, {})
+            self.assertEqual((v['kind'], v['login_server'], v['pin'], v['exit_node'], v['hostname'], v['dns'], v['magic_dns'],
+                              v['transport_nets']),
+                             ('tailscale', 'https://203.0.113.9:8443', None, 'peer-1', 'ds-work', ['100.100.100.100'], True,
+                              ['10.9.8.0/24']))
+            self.assertNotIn('UNITTESTSENTINEL', repr(v))
+            self.assertEqual(os.stat(p / 'authkey').st_mode & 0o777, 0o600)
+            # A named control server is resolved once, here, and pinned for the daemon.
+            v = ds.tailscale_import(self.tailscale_args(login_server='http://localhost:8080', dns=['100.64.0.9']), p, {})
+            self.assertEqual((v['pin'], v['dns'], v['magic_dns']), (['localhost', '127.0.0.1'], ['100.64.0.9'], False))
+            # No option of the importer can request SSH, advertised routes, serve or a relay.
+            self.assertFalse(set(v) & {'ssh', 'advertise_routes', 'advertise_exit_node', 'serve', 'funnel', 'operator'})
+
+    def test_tailscale_configuration_rejects_malformed_or_secret_bearing_input(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t)
+            (p / 'spaces').write_text('two words\n'); (p / 'short').write_text('x\n')
+            (p / 'cakey').write_text('-----BEGIN CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\n')
+            for bad in [dict(login_server='ftp://h'), dict(login_server='https://u:p@h'), dict(login_server='https://h/?k=v'),
+                        dict(login_server='https://'), dict(exit_node='a b'), dict(exit_node='-x'), dict(hostname='UPPER'),
+                        dict(hostname='a' * 64), dict(dns=['resolver.example']), dict(auth_key_file=str(p / 'spaces')),
+                        dict(auth_key_file=str(p / 'short')), dict(ca_file=str(p / 'cakey'))]:
+                with self.subTest(bad=bad), self.assertRaises((ds.Error, ValueError)) as raised:
+                    ds.tailscale_import(self.tailscale_args(**bad), p, {})
+                self.assertNotIn('two words', str(raised.exception))
+
+    def test_tailscale_daemon_gets_a_private_etc_without_a_resolver(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = dict(state=t, vpn=dict(kind='tailscale', pin=['control.example', '203.0.113.9']))
+            (Path(t) / 'vpn').mkdir(); (Path(t) / 'vpn' / 'ca.pem').write_text('EXTRA-CA\n')
+            ds.ts_prepare(c)
+            etc = Path(t) / 'tailscale' / 'etc'
+            self.assertEqual([l for l in (etc / 'resolv.conf').read_text().splitlines() if not l.startswith('#')], ['nameserver 127.0.0.1'])
+            self.assertIn('203.0.113.9 control.example', (etc / 'hosts').read_text())
+            self.assertTrue((etc / 'ssl/certs/ca-certificates.crt').read_text().endswith('EXTRA-CA\n'))
+            self.assertEqual(os.stat(Path(t) / 'tailscale').st_mode & 0o777, 0o700)
+            for needed in ['/run', '/etc', '/var/lib/tailscale', "'/usr'"]:
+                self.assertIn(needed, ds.TS_BOX)
+
 
 if __name__ == '__main__':
     unittest.main()

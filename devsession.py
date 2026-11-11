@@ -23,7 +23,7 @@ SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 BLOCKED = '0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 192.0.0.0/24, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4'
 
 
-VERSION = '0.3.0'
+VERSION = '0.4.0'
 # Exit statuses reserved for devsession itself. exec/shell pass the command's
 # own status through unchanged; 126/127/128+N keep their shell meaning.
 EXIT_ERROR, EXIT_USAGE, EXIT_NOSESSION, EXIT_PRIVILEGE, EXIT_BUSY, EXIT_CONFLICT = 120, 121, 122, 123, 124, 125
@@ -247,7 +247,7 @@ def names(c):
     return 'ds' + tag + 'c', 'ds' + tag + 'g', 'ds' + tag + 'h', 'ds_' + tag
 
 
-def network(c):
+def network(c, login_timeout=45):
     """Build default-deny policy before any workload exists."""
     client, gateway, hostif, table = names(c)
     run(['ip', 'netns', 'add', client])
@@ -270,8 +270,24 @@ def network(c):
     run(['ip', '-n', gateway, 'addr', 'add', '10.203.0.1/30', 'dev', 'lan'])
     run(['ip', '-n', client, 'addr', 'add', '10.203.0.2/30', 'dev', 'eth0'])
     vpn = c.get('vpn', {}) if c['mode'] == 'vpn' else {}
-    transport = ''
-    if vpn:
+    tailscale = vpn.get('kind') == 'tailscale'
+    transport = quad100 = ''
+    if tailscale:
+        # Tailscale has no single endpoint (control, DERP relays, STUN, direct
+        # peer UDP). The rule instead: this namespace holds exactly one
+        # process, the session's tailscaled, so OUTPUT on wan is that daemon's
+        # transport and nothing else; workload packets are FORWARD and may
+        # only enter vpn0. Cleartext DNS from the daemon is refused outright.
+        # Nor may it address the host end of its own link (it probes its
+        # default gateway for NAT-PMP/PCP/UPnP port mappings) or multicast.
+        transport = (f'oifname "wan" ip daddr {{ {a}, 224.0.0.0/4, 255.255.255.255 }} counter drop\n'
+                     '   oifname "wan" meta l4proto { tcp, udp } th dport 53 counter drop\n'
+                     '   oifname "wan" meta l4proto { tcp, udp } accept')
+        # The service address answers DNS only; its other ports stay closed to workloads.
+        quad100 = (f'iifname "lan" oifname "vpn0" ip daddr {TS_QUAD100} meta l4proto {{ tcp, udp }} '
+                   'th dport != 53 counter drop')
+        run(['sysctl', '-qw', 'net.ipv4.conf.all.rp_filter=2', 'net.ipv4.conf.default.rp_filter=2'], ns=gateway)
+    elif vpn:
         proto = vpn.get('proto', 'udp')
         transport = f'ip daddr {vpn["endpoint"]} {proto} dport {vpn["port"]} accept'
     outif = 'vpn0' if vpn else 'wan'
@@ -292,6 +308,7 @@ table inet guard {{
  }}
  chain forward {{ type filter hook forward priority 0; policy drop;
    meta nfproto ipv6 counter drop
+   {quad100}
    iifname "lan" oifname "{outif}" counter accept
    iifname "{outif}" oifname "lan" ct state established,related counter accept
    counter drop
@@ -308,7 +325,12 @@ table ip nat {{ chain post {{ type nat hook postrouting priority srcnat; policy 
                   if r.get('dst') and r['dst'] != 'default']
     blocked = ', '.join(str(n) for n in ipaddress.collapse_addresses(
         [ipaddress.IPv4Network(n) for n in BLOCKED.split(', ') + local_nets]))
-    if vpn:
+    if tailscale:
+        # Private ranges stay blocked for the daemon too (including the host's
+        # own tailnet, 100.64.0.0/10) unless named: a self-hosted control or
+        # relay server on a private address.
+        exceptions += ''.join(f'iifname "{hostif}" ip daddr {n} accept\n' for n in vpn.get('transport_nets', []))
+    elif vpn:
         exceptions += f'iifname "{hostif}" {transport}\n'
     # No host default route/resolver changes. All hooks match the owned link.
     run(['nft', '-f', '-'], input=f'''
@@ -338,7 +360,9 @@ table ip {table} {{ chain post {{ type nat hook postrouting priority srcnat; pol
         run(['ip'] + (['-n', ns] if ns else []) + ['link', 'set', dev, 'up'])
     run(['ip', '-n', gateway, 'route', 'add', 'default', 'via', a])
     run(['ip', '-n', client, 'route', 'add', 'default', 'via', '10.203.0.1'])
-    if vpn:
+    if tailscale:
+        start_tailscale(c, gateway, login_timeout)
+    elif vpn:
         run(['ip', '-n', gateway, 'route', 'replace', vpn['endpoint'] + '/32', 'via', a])
         start_vpn(c, gateway)
 
@@ -372,6 +396,251 @@ def start_vpn(c, gateway):
                 return
             time.sleep(.1)
         raise Error('OpenVPN did not configure its tunnel within 30s; inspect root-only openvpn.log')
+
+
+# ---------------------------------------------------------------------------
+# Tailscale backend. Each session runs its own tailscaled in its gateway
+# network namespace, with its own socket, state directory, interface and
+# port. The host's tailscaled and its tailnet are never contacted: every
+# tailscale binary we start runs inside TS_BOX, a private mount namespace in
+# which the host's /etc, /run (D-Bus, systemd-resolved, NetworkManager and
+# the host daemon's socket) and /var/lib/tailscale do not exist.
+TS_BOX = r'''import json,os,subprocess,sys
+cfg=json.loads(sys.argv[1])
+os.unshare(os.CLONE_NEWNS)
+def mount(*a): subprocess.run(('/usr/bin/mount',)+a,check=True)
+mount('--make-rprivate','/')
+mount('-t','tmpfs','-o','mode=755,nosuid,nodev','tmpfs','/run')
+for d in ('/var/lib/tailscale','/var/cache/tailscale'):
+ if os.path.isdir(d): mount('-t','tmpfs','-o','mode=700','tmpfs',d)
+mount('--bind',cfg['etc'],'/etc')
+mount('--bind','/usr','/usr'); mount('-o','remount,bind,ro','/usr')
+os.execve(cfg['argv'][0],cfg['argv'],cfg['env'])
+'''
+TS_QUAD100 = '100.100.100.100'
+
+
+def ts_paths(c):
+    base = Path(c['state']) / 'tailscale'
+    return base, base / 'etc', base / 'var', base / 'tailscaled.sock'
+
+
+def ts_binary(name):
+    path = shutil.which(name, path=SYSTEM_PATH)
+    if not path:
+        raise Error(f'{name} is not installed; the tailscale backend needs the tailscale package')
+    return path
+
+
+def ts_box(c, argv):
+    base, etc, var, sock = ts_paths(c)
+    env = {'PATH': SYSTEM_PATH, 'HOME': str(var), 'LANG': 'C.UTF-8', 'TS_NO_LOGS_NO_SUPPORT': 'true',
+           'TS_LOGS_DIR': str(var), 'TS_DISABLE_PORTMAPPER': 'true', 'TS_DISABLE_UPNP': 'true'}
+    return ['ip', 'netns', 'exec', c.get('netns') or names(c)[1], '/usr/bin/python3', '-I', '-c', TS_BOX,
+            json.dumps(dict(etc=str(etc), argv=[str(a) for a in argv], env=env))]
+
+
+def ts(c, *args, check=True, timeout=30):
+    """One tailscale CLI call against this session's daemon, never the host's."""
+    sock = ts_paths(c)[3]
+    try:
+        p = sp.run(ts_box(c, [ts_binary('tailscale'), f'--socket={sock}'] + list(args)), stdin=sp.DEVNULL,
+                   stdout=sp.PIPE, stderr=sp.PIPE, text=True, timeout=timeout,
+                   env={'PATH': SYSTEM_PATH, 'LANG': 'C.UTF-8'})
+    except sp.TimeoutExpired:
+        if check:
+            raise Error(f'tailscale {args[0]} did not finish within {timeout}s')
+        return None
+    if check and p.returncode:
+        raise Error(f'tailscale {args[0]} failed: {printable(p.stderr.strip() or p.stdout.strip())[:400]}')
+    return p
+
+
+def ts_status(c):
+    p = ts(c, 'status', '--json', check=False, timeout=10)
+    try:
+        return json.loads(p.stdout) if p else {}
+    except ValueError:
+        return {}
+
+
+def tailscale_import(args, dest, previous):
+    """Validate `vpn configure --tailscale` input. Only these options exist:
+    nothing that exposes the gateway (SSH, advertised routes or exit node,
+    serve/funnel, a relay) can be requested, and start() verifies the result."""
+    import urllib.parse
+    v = dict(kind='tailscale', login_server=None, pin=None, exit_node=args.exit_node or None,
+             accept_routes=bool(args.accept_routes), hostname=args.hostname or 'ds-' + args.name,
+             magic_dns=not args.dns, dns=[ipv4(x) for x in (args.dns or [TS_QUAD100])],
+             transport_nets=[str(ipaddress.IPv4Network(x, strict=False)) for x in args.transport_net],
+             port=previous.get('port') if previous.get('kind') == 'tailscale' else None)
+    if not re.fullmatch(r'[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?', v['hostname']):
+        raise Error('Tailscale --hostname must be a DNS label: [a-z0-9-], at most 63 characters')
+    if v['exit_node'] and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]{0,252}', v['exit_node']):
+        raise Error('Tailscale --exit-node must be a peer name, tailnet IPv4 address or node ID')
+    if args.login_server:
+        u = urllib.parse.urlsplit(args.login_server)
+        if u.scheme not in ('https', 'http') or not u.hostname or u.username or u.password or u.query or u.fragment:
+            raise Error('Tailscale --login-server must be http(s)://HOST[:PORT][/PATH] without credentials or a query')
+        try:
+            ip = str(ipaddress.IPv4Address(u.hostname))
+        except ValueError:
+            # Like the other backends: resolved once, on the host, at configuration
+            # time. The daemon gets the result as a hosts entry and no resolver.
+            ip = endpoint(u.hostname)
+            v['pin'] = [u.hostname.lower(), ip]
+        v['login_server'] = urllib.parse.urlunsplit((u.scheme, u.netloc, u.path.rstrip('/'), '', ''))
+    if args.auth_key_stdin or args.auth_key_file:
+        key = (sys.stdin.read() if args.auth_key_stdin else Path(args.auth_key_file).read_text()).strip()
+        if not 8 <= len(key) <= 512 or not re.fullmatch(r'[\x21-\x7e]+', key):
+            raise Error('Tailscale auth key must be one line of 8-512 printable characters (value not shown)')
+        write(dest / 'authkey', key + '\n')
+    elif previous.get('kind') == 'tailscale' and (Path(args.previous_dir) / 'authkey').is_file():
+        shutil.copyfile(Path(args.previous_dir) / 'authkey', dest / 'authkey')
+        os.chmod(dest / 'authkey', 0o600)
+    if args.ca_file:
+        pem = Path(args.ca_file).read_text()
+        if len(pem) > 1 << 20 or 'PRIVATE KEY' in pem or '-----BEGIN CERTIFICATE-----' not in pem:
+            raise Error('Tailscale --ca-file must hold PEM certificates only')
+        write(dest / 'ca.pem', pem)
+    elif previous.get('kind') == 'tailscale' and (Path(args.previous_dir) / 'ca.pem').is_file():
+        shutil.copyfile(Path(args.previous_dir) / 'ca.pem', dest / 'ca.pem')
+    v['ca'] = (dest / 'ca.pem').exists()
+    return v
+
+
+def ts_prepare(c):
+    """Private /etc for the daemon: no resolver, pinned control host, CA bundle."""
+    v = c['vpn']
+    base, etc, var, sock = ts_paths(c)
+    base.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(base, 0o700)
+    for d in [etc, etc / 'ssl', etc / 'ssl' / 'certs', var]:
+        d.mkdir(mode=0o700 if d == var else 0o755, exist_ok=True)
+    # The daemon must never resolve through the host or send cleartext DNS
+    # itself; the control host comes from the hosts file. Its "system
+    # resolver" is this namespace's own loopback, where nothing listens:
+    # tailscaled needs some base resolver before it applies tailnet DNS
+    # routes, and names outside those routes then fail instead of leaving.
+    write(etc / 'resolv.conf', '# devsession: no system resolver for the gateway daemon\nnameserver 127.0.0.1\n', 0o644)
+    write(etc / 'hosts', '127.0.0.1 localhost\n' + (f'{v["pin"][1]} {v["pin"][0]}\n' if v.get('pin') else ''), 0o644)
+    write(etc / 'nsswitch.conf', 'passwd: files\ngroup: files\nhosts: files dns\n', 0o644)
+    write(etc / 'passwd', 'root:x:0:0:root:/root:/bin/false\n', 0o644)
+    write(etc / 'group', 'root:x:0:\n', 0o644)
+    bundle = ''
+    for candidate in ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt']:
+        if Path(candidate).is_file():
+            bundle = Path(candidate).read_text()
+            break
+    extra = Path(c['state']) / 'vpn' / 'ca.pem'
+    write(etc / 'ssl' / 'certs' / 'ca-certificates.crt', bundle + ('\n' + extra.read_text() if extra.is_file() else ''), 0o644)
+    with contextlib.suppress(FileNotFoundError):
+        sock.unlink()
+
+
+def ts_port(c):
+    """A UDP port of this session's own, distinct from the host daemon's 41641."""
+    used = {x.get('vpn', {}).get('port') for x in configs() if x['state'] != c['state']}
+    return next(p for p in range(41700, 42700) if p not in used)
+
+
+def start_tailscale(c, gateway, login_timeout=45):
+    v = c['vpn']
+    base, etc, var, sock = ts_paths(c)
+    ts_prepare(c)
+    if not v.get('port'):
+        v['port'] = ts_port(c)
+        save(c)
+    log = open(base / 'tailscaled.log', 'w')
+    p = sp.Popen(ts_box(c, [ts_binary('tailscaled'), '--tun=vpn0', f'--port={v["port"]}', f'--socket={sock}',
+                            f'--statedir={var}', f'--state={var}/tailscaled.state', '--no-logs-no-support',
+                            '--verbose=0']),
+                 stdin=sp.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                 env={'PATH': SYSTEM_PATH, 'LANG': 'C.UTF-8'}, close_fds=True)
+    log.close()
+    for _ in range(150):
+        if p.poll() is not None:
+            raise Error(f'tailscaled exited; root can inspect {base}/tailscaled.log')
+        state = ts_status(c).get('BackendState')
+        if state and state != 'NoState':
+            break
+        time.sleep(.1)
+    else:
+        raise Error('tailscaled did not answer on its socket within 15s')
+    key = Path(c['state']) / 'vpn' / 'authkey'
+    if state == 'NeedsLogin' and not key.is_file():
+        raise Error('Tailscale node is not logged in and no auth key is configured: '
+                    'vpn configure NAME --tailscale --auth-key-file FILE')
+    # Every preference is stated on each start. --reset drops anything else a
+    # previous run (or someone with root) left in the node state.
+    # With an exit node (selected below) "LAN access" must be allowed: tailscaled otherwise
+    # routes every connected subnet into the tunnel, which here means the
+    # gateway's own lan/wan links, and replies could not return to the
+    # workload. Nothing is opened by it: workload packets toward those links
+    # are refused by the forward chain (lan -> vpn0 only), not by routing.
+    up = ['up', '--reset', f'--timeout={login_timeout}s', '--shields-up=true', '--ssh=false',
+          '--advertise-routes=', '--advertise-exit-node=false', '--advertise-connector=false',
+          '--netfilter-mode=off',
+          '--accept-routes=' + ('true' if v.get('accept_routes') else 'false'),
+          '--accept-dns=' + ('true' if v.get('magic_dns') else 'false'),
+          '--hostname=' + v['hostname'], '--exit-node=']
+    if v.get('login_server'):
+        up.append('--login-server=' + v['login_server'])
+    if key.is_file():
+        up.append(f'--auth-key=file:{key}')  # read by the client from the file: never in argv
+    done = ts(c, *up, check=False, timeout=login_timeout + 15)
+    if done is None or done.returncode:
+        detail = printable((done.stderr.strip() or done.stdout.strip()) if done else 'timed out')[:300]
+        raise Error('Tailscale login or configuration failed (check the auth key, login server and exit node): ' + detail)
+    ts(c, 'set', '--auto-update=false', '--webclient=false', '--relay-server-port=', check=False)
+    ts(c, 'serve', 'reset', check=False)
+    ts(c, 'funnel', 'reset', check=False)
+    try:
+        prefs = json.loads(ts(c, 'debug', 'prefs').stdout)
+    except ValueError:
+        raise Error('Cannot read tailscale preferences to verify that the gateway is not exposed')
+    exposed = [name for name, bad in [
+        ('Tailscale SSH', prefs.get('RunSSH')), ('shields down', not prefs.get('ShieldsUp')),
+        ('advertised routes or exit node', prefs.get('AdvertiseRoutes')),
+        ('app connector', (prefs.get('AppConnector') or {}).get('Advertise')),
+        ('web client', prefs.get('RunWebClient')), ('peer relay', prefs.get('RelayServerPort') is not None),
+        ('daemon-managed netfilter', prefs.get('NetfilterMode') not in (0, None)),
+        ('automatic updates', (prefs.get('AutoUpdate') or {}).get('Apply'))] if bad]
+    if exposed:
+        raise Error('Tailscale preferences would expose or alter the gateway: ' + ', '.join(exposed))
+    for _ in range(100):
+        status = ts_status(c)
+        if status.get('BackendState') == 'Running' and (status.get('Self') or {}).get('TailscaleIPs'):
+            break
+        time.sleep(.1)
+    else:
+        raise Error('Tailscale did not reach the Running state with a tailnet address within 10s')
+    if v.get('exit_node'):
+        # Selected after login (a peer cannot be named before the first
+        # netmap) and before any workload exists. Without it nothing but
+        # tailnet addresses is reachable, so there is no window of direct access.
+        for _ in range(60):
+            done = ts(c, 'set', '--exit-node=' + v['exit_node'], '--exit-node-allow-lan-access=true', check=False)
+            if done and done.returncode == 0 and ts_status(c).get('ExitNodeStatus'):
+                return
+            time.sleep(.25)
+        raise Error('Tailscale exit node is not available in the tailnet: ' + v['exit_node'])
+
+
+def tailscale_logout(c):
+    """Best effort, bounded: deregister the node when its session is deleted."""
+    v = c.get('vpn') or {}
+    if v.get('kind') != 'tailscale' or not (ts_paths(c)[2] / 'tailscaled.state').exists():
+        return None
+    try:
+        if not (alive(c) and c['mode'] == 'vpn'):
+            stop(c)
+            c['mode'] = 'vpn'
+            network(c, login_timeout=15)
+        done = ts(c, 'logout', check=False, timeout=15)
+        return bool(done and done.returncode == 0)
+    except (Error, OSError):
+        return False
 
 
 ETC_SHARE = ['ssl/certs', 'ssl/openssl.cnf', 'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d',
@@ -1411,6 +1680,8 @@ def parser(split=False):
             q.add_argument('name', nargs='?', help='Session name; omitted or ".": the session this directory is bound to')
         if op in ['stop', 'delete']:
             q.add_argument('--if-exists', action='store_true', help='Succeed when there is no such session')
+        if op == 'delete':
+            q.add_argument('--no-logout', action='store_true', help='Do not try to log a Tailscale node out of its tailnet first')
         if op == 'shell':
             q.add_argument('--forward', action='append', default=[], metavar='VARIABLE')
             q.add_argument('--cwd', metavar='DIR', help='Working directory inside the session')
@@ -1453,7 +1724,19 @@ def parser(split=False):
     v = add(sub, 'vpn').add_subparsers(dest='vpn_action', required=True, parser_class=Parser)
     q = add(v, 'configure'); q.add_argument('name')
     g = q.add_mutually_exclusive_group(required=True); g.add_argument('--wireguard'); g.add_argument('--openvpn')
+    g.add_argument('--tailscale', action='store_true', help='Join a tailnet as this session\'s own node')
     q.add_argument('--dns', action='append', metavar='IPv4')
+    t = q.add_argument_group('tailscale options')
+    k = t.add_mutually_exclusive_group()
+    k.add_argument('--auth-key-file', metavar='FILE', help='Auth key for unattended login (never on the command line)')
+    k.add_argument('--auth-key-stdin', action='store_true', help='Read the auth key from stdin')
+    t.add_argument('--login-server', metavar='URL', help='Self-hosted control server; default is Tailscale\'s')
+    t.add_argument('--ca-file', metavar='FILE', help='Extra PEM CA certificate(s) for a self-hosted control or relay server')
+    t.add_argument('--exit-node', metavar='PEER', help='Send all IPv4 through this peer; without it only tailnet addresses and accepted routes are reachable')
+    t.add_argument('--accept-routes', action='store_true', help='Accept subnet routes advertised in the tailnet')
+    t.add_argument('--hostname', metavar='NAME', help='Node name in the tailnet (default ds-SESSION)')
+    t.add_argument('--transport-net', action='append', default=[], metavar='CIDR',
+                   help='Private range the gateway daemon (never a workload) may reach, e.g. a control server on a private address')
     q = add(sub, 'credential', help='Import stdin/file into private HOME, never argv; auto-starts session')
     q.add_argument('name'); q.add_argument('destination', help='Relative path in private HOME, e.g. .ssh/id_ed25519')
     q.add_argument('--file', help='Default is stdin')
@@ -1464,7 +1747,7 @@ REQUIRED = ['bwrap', 'ip', 'nft', 'nsenter', 'setpriv', 'python3']
 
 
 def doctor(context):
-    cmds = ['bwrap', 'ip', 'nft', 'nsenter', 'setpriv', 'wg', 'openvpn', 'socat',
+    cmds = ['bwrap', 'ip', 'nft', 'nsenter', 'setpriv', 'wg', 'openvpn', 'tailscale', 'tailscaled', 'socat',
             'terraform', 'ansible', 'tmux', 'oh-my-posh', 'az', 'python3', 'node', 'rustc', 'mise', 'pyenv']
     found = {cmd: shutil.which(cmd, path=context.get('path', SYSTEM_PATH)) for cmd in cmds}
     missing = [cmd for cmd in REQUIRED if not found[cmd]]
@@ -1716,6 +1999,13 @@ def main(argv=None):
             start(c)
         elif args.action in ['stop', 'delete']:
             result['changed'] = args.action == 'delete' or alive(c) or c.get('phase') != 'stopped'
+            if args.action == 'delete' and not args.no_logout:
+                logged_out = tailscale_logout(c)
+                if logged_out is not None:
+                    result['tailscale_logout'] = logged_out
+                    if not logged_out and not OUT['quiet']:
+                        print('devsession: could not log the Tailscale node out; it stays registered until '
+                              'its key expires or it is removed in the tailnet', file=sys.stderr)
             stop(c)
             if args.action == 'delete':
                 shutil.rmtree(c['state'])
@@ -1741,7 +2031,7 @@ def main(argv=None):
             else:
                 stopped(c)
                 if args.mode == 'vpn' and not c.get('vpn'):
-                    raise Error('Configure WireGuard or OpenVPN before selecting VPN mode', EXIT_CONFLICT)
+                    raise Error('Configure WireGuard, OpenVPN or Tailscale before selecting VPN mode', EXIT_CONFLICT)
                 c['mode'] = args.mode; save(c)
         elif args.action == 'vpn':
             stopped(c)
@@ -1750,7 +2040,18 @@ def main(argv=None):
             staging = Path(c['state']) / 'vpn-import'
             shutil.rmtree(staging, ignore_errors=True); staging.mkdir(mode=0o700)
             try:
-                v = wireguard_import(args.wireguard, staging, args.dns) if args.wireguard else openvpn_import(args.openvpn, staging, args.dns)
+                if args.tailscale:
+                    args.previous_dir = str(folder)
+                    v = tailscale_import(args, staging, c.get('vpn') or {})
+                    old = c.get('vpn') or {}
+                    if old.get('kind') == 'tailscale' and old.get('login_server') != v['login_server']:
+                        # A node identity belongs to one control server.
+                        shutil.rmtree(ts_paths(c)[2], ignore_errors=True)
+                elif any([args.auth_key_file, args.auth_key_stdin, args.login_server, args.ca_file, args.exit_node,
+                          args.accept_routes, args.hostname, args.transport_net]):
+                    raise Error('Those options belong to --tailscale', EXIT_USAGE)
+                else:
+                    v = wireguard_import(args.wireguard, staging, args.dns) if args.wireguard else openvpn_import(args.openvpn, staging, args.dns)
                 if v['kind'] == 'openvpn':
                     data = (staging / 'client.ovpn').read_text().replace(str(staging) + '/', str(folder) + '/')
                     write(staging / 'client.ovpn', data)
