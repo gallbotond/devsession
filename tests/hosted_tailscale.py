@@ -9,8 +9,9 @@ development host only (the key is a real credential: never copy it anywhere):
 Without TS_AUTHKEY it exits 77 ("skipped"). It creates session `ts-hosted`,
 logs in, checks the node is Running with a tailnet address and that MagicDNS
 answers through the tunnel, verifies the host is unchanged, and deletes the
-session, which logs the node out. NOTE: as of 2026-11-11 this script has never
-been executed, because no key was available; see docs/RESULTS.md.
+session, which logs the node out. It refuses a key for the tailnet that the
+host's own tailscaled belongs to. NOTE: as of 2026-11-11 only that refusal has
+been executed; see docs/RESULTS.md.
 """
 import json
 import os
@@ -36,6 +37,12 @@ def main():
         at.cli('net', 'set', NAME, 'vpn')
         at.cli('start', NAME, timeout=180)
         status = json.loads(at.session_ts(NAME, 'status', '--json').stdout)
+        # The key must be for a throwaway tailnet, never the one this host's own
+        # tailscaled belongs to. Checked first; the finally block logs the node out.
+        mine = json.loads(at.cmd(['tailscale', 'status', '--json'], check=False).stdout or '{}')
+        same = lambda k: status.get(k) and status.get(k) == mine.get(k)
+        if same('MagicDNSSuffix') or same('CurrentTailnet'):
+            raise AssertionError('TS_AUTHKEY belongs to the tailnet of this host\'s own tailscaled; use a throwaway tailnet')
         address = status['Self']['TailscaleIPs'][0]
         assert status['BackendState'] == 'Running' and address.startswith('100.'), status['BackendState']
         name = status['Self']['DNSName'].rstrip('.')

@@ -92,7 +92,12 @@ time while IAP access kept working.
 - **Tailscale's hosted control plane.** `TS_AUTHKEY` for a throwaway tailnet
   was not set, so interoperability with the hosted service, its DERP network
   and its default DNS behaviour was not executed.
-  `tests/hosted_tailscale.py` is prepared for it and has never been run.
+  `tests/hosted_tailscale.py` is prepared for it. One attempt on 2026-11-11
+  stopped at its first check: the key supplied belonged to the tailnet of the
+  host's own tailscaled, which must not be tested against. The session had
+  logged in (so unattended login against the hosted control plane did work),
+  was deleted within the same run and its node logged out; no reachability,
+  DNS or fail-closed assertion was executed. The check remains unverified.
 - Relayed (DERP-only) transport on the real path: the real run connected
   directly. DERP was exercised only as far as each lab daemon's own home
   connection.
