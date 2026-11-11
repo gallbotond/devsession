@@ -59,6 +59,12 @@ transport, a distinct public egress address and path-MTU behaviour over a WAN
 are now executed evidence **for the Tailscale backend**. They remain
 unverified for WireGuard and OpenVPN.
 
+After the recorded 40-group run, two small changes were made and the
+`tailscale` group was run again on its own (T1-T10 passed, with a third T9
+case): `delete` now also logs out a running session whose daemon has died,
+by restarting it from the persisted node state, and a login error no longer
+repeats a key identifier quoted by the control server.
+
 Found by these runs and fixed before the final results:
 
 - With an exit node, tailscaled's default (LAN access disallowed) routed the
@@ -92,12 +98,16 @@ time while IAP access kept working.
 - **Tailscale's hosted control plane.** `TS_AUTHKEY` for a throwaway tailnet
   was not set, so interoperability with the hosted service, its DERP network
   and its default DNS behaviour was not executed.
-  `tests/hosted_tailscale.py` is prepared for it. One attempt on 2026-11-11
-  stopped at its first check: the key supplied belonged to the tailnet of the
-  host's own tailscaled, which must not be tested against. The session had
-  logged in (so unattended login against the hosted control plane did work),
-  was deleted within the same run and its node logged out; no reachability,
-  DNS or fail-closed assertion was executed. The check remains unverified.
+  `tests/hosted_tailscale.py` is prepared for it. Two attempts on 2026-11-11
+  did not get as far as its assertions. The key supplied belonged to the
+  tailnet of the host's own tailscaled; the first attempt logged in (so
+  unattended login against the hosted control plane did work once), was
+  stopped by the script's same-tailnet guard, and the session was deleted
+  and its node logged out within the same run. The owner then allowed that
+  tailnet explicitly (`TS_ALLOW_HOST_TAILNET=1`), but the key was single-use
+  and already spent, so the second attempt failed at login and registered
+  nothing. No reachability, DNS, relay or fail-closed assertion has been
+  executed against the hosted service. The check remains unverified.
 - Relayed (DERP-only) transport on the real path: the real run connected
   directly. DERP was exercised only as far as each lab daemon's own home
   connection.
