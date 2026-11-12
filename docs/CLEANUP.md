@@ -41,7 +41,9 @@ sudo apparmor_parser -r /etc/apparmor.d/wg
 
 Skip the AppArmor commands on systems without that profile. Installed package
 dependencies are not removed automatically because other host applications may
-use them. This task installed Bubblewrap, WireGuard tools, OpenVPN, Easy-RSA,
+use them. `install.sh` itself installs any of bubblewrap, iproute2, nftables,
+util-linux, wireguard-tools, openvpn and python3 that were missing; its output
+names the ones it added on your system. This task installed Bubblewrap, WireGuard tools, OpenVPN, Easy-RSA,
 dnsmasq-base, Ansible, Python venv support, socat and their package dependencies;
 see `INVENTORY.md`. Package installation also enabled the distribution's
 OpenVPN service and PC/SC socket dependency (no host VPN profile was started).

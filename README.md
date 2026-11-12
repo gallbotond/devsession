@@ -12,11 +12,18 @@ util-linux 2.41+, nftables, WireGuard tools, OpenVPN 2.7 and Tailscale 1.104
 (against headscale 0.29).
 
 ```sh
-sudo apt-get install bubblewrap iproute2 nftables util-linux wireguard-tools openvpn
-# optional, for the Tailscale backend: the tailscale package (tailscale, tailscaled)
 ./install.sh
 devsession doctor
 ```
+
+`install.sh` checks the prerequisites and installs the missing ones with
+`apt-get` (bubblewrap, iproute2, nftables, util-linux, wireguard-tools,
+openvpn, python3). `./install.sh --no-install` only reports what is missing
+and exits 1, for systems where you install packages yourself or that have no
+`apt-get`. Optional tools are reported, never installed for you: `socat` for
+`--publish` and the `tailscale` package for the Tailscale backend. A
+distribution release whose Bubblewrap or util-linux is too old (see below)
+cannot be fixed by the script; it says so and stops.
 
 Bubblewrap must support `--bind-fd`; nsenter must support `--wdns`. Publishing
 TCP ports additionally needs systemd and socat. An ordinary sudo-authorized

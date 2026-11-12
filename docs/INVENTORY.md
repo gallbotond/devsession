@@ -106,6 +106,10 @@ OpenCode use inside a session requires independent credentials and was not teste
   `/tmp/opencode/hs/headscale` with its published SHA-256 verified. It is not
   installed system-wide and not needed at runtime.
 - `strace` (already present) is used by one activation check.
+- `install.sh` now installs missing prerequisites itself. On this host the
+  path was exercised by removing `wireguard-tools`, confirming that
+  `--no-install` reports it and exits 1, and letting a plain run reinstall it;
+  a WireGuard session worked afterwards.
 - No package was installed for features 1-3. The scripting checks create and
   remove a throwaway user `dvs-pwtest` and `/etc/sudoers.d/dvs-pwtest`.
 
